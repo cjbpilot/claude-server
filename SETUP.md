@@ -82,17 +82,15 @@ What this does:
 - Copies the repo to `C:\ClaudeAgent\app`.
 - Creates a Python venv at `C:\ClaudeAgent\venv`.
 - Installs dependencies and the agent package (editable).
-- Downloads NSSM (<https://nssm.cc>) to `C:\ClaudeAgent\nssm.exe` if it's
-  not already installed.
 - Seeds `C:\ProgramData\ClaudeAgent\agent.toml` from the example and locks
   down `nats.creds` so only SYSTEM/Admins can read it.
-- Registers the `ClaudeAgent` service via NSSM: auto-start, restart on
-  crash, stdout/stderr capture with rotation, graceful stop via Ctrl+C.
-- Starts the service.
+- Registers the `ClaudeAgent` Scheduled Task: runs at boot as SYSTEM with
+  highest privileges, restarts automatically on crash, no user login needed.
+- Starts the task.
 
 Check it's running:
 
-    Get-Service ClaudeAgent
+    Get-ScheduledTask -TaskName ClaudeAgent
     Get-Content C:\ProgramData\ClaudeAgent\logs\agent.log -Tail 20
 
 You should see a line like:

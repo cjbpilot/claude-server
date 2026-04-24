@@ -18,7 +18,8 @@ install_dir = "C:/ClaudeAgent/app"
 # dependencies after a git pull.
 python_exe = "C:/ClaudeAgent/venv/Scripts/python.exe"
 
-# Windows service name. Must match install-agent.ps1.
+# Scheduled Task name (used to restart the agent from self_update).
+# Must match install-agent.ps1's -TaskName (default ClaudeAgent).
 service_name = "ClaudeAgent"
 
 # Heartbeat interval in seconds.

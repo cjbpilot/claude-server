@@ -77,15 +77,21 @@ def main() -> int:
     def step(name: str, rc: int, output: str) -> None:
         report["steps"].append({"name": name, "rc": rc, "output": output[-4000:]})
 
+    task = args.service
+
+    def end_task():
+        return run(["schtasks", "/End", "/TN", task], cwd=install_dir, timeout=60)
+
+    def run_task():
+        return run(["schtasks", "/Run", "/TN", task], cwd=install_dir, timeout=60)
+
     log(f"waiting for agent pid {args.pid} to exit ...")
     if not wait_for_pid_exit(args.pid, timeout_s=60):
-        # Agent didn't exit gracefully — force-stop the service.
-        log("agent did not exit; stopping service via sc")
-        rc, out = run(["sc", "stop", args.service], cwd=install_dir, timeout=60)
-        step("sc_stop", rc, out)
+        log("agent did not exit; stopping scheduled task")
+        rc, out = end_task()
+        step("task_end", rc, out)
         time.sleep(3)
 
-    # Capture pre-update commit so we can roll back on failure.
     rc_rev, pre_rev = run(["git", "rev-parse", "HEAD"], cwd=install_dir)
     pre_rev = pre_rev.strip()
     step("pre_rev", rc_rev, pre_rev)
@@ -95,7 +101,7 @@ def main() -> int:
     if rc != 0:
         report["error"] = "git fetch failed"
         write_report(report)
-        run(["sc", "start", args.service], cwd=install_dir)
+        run_task()
         return 1
 
     rc, out = run(["git", "pull", "--ff-only"], cwd=install_dir)
@@ -103,7 +109,7 @@ def main() -> int:
     if rc != 0:
         report["error"] = "git pull failed (not fast-forward?)"
         write_report(report)
-        run(["sc", "start", args.service], cwd=install_dir)
+        run_task()
         return 1
 
     rc_post, post_rev = run(["git", "rev-parse", "HEAD"], cwd=install_dir)
@@ -112,21 +118,19 @@ def main() -> int:
     report["pre_rev"] = pre_rev
     report["post_rev"] = post_rev
 
-    # Reinstall deps. This is cheap if nothing changed.
     req = str(Path(install_dir) / "agent" / "requirements.txt")
     rc, out = run([args.python, "-m", "pip", "install", "-r", req], cwd=install_dir, timeout=600)
     step("pip_install", rc, out)
     if rc != 0:
-        # Roll back and restart.
         log("pip install failed; rolling back")
         run(["git", "reset", "--hard", pre_rev], cwd=install_dir)
         report["error"] = "pip install failed, rolled back"
         write_report(report)
-        run(["sc", "start", args.service], cwd=install_dir)
+        run_task()
         return 1
 
-    rc, out = run(["sc", "start", args.service], cwd=install_dir, timeout=60)
-    step("sc_start", rc, out)
+    rc, out = run_task()
+    step("task_run", rc, out)
 
     report["ok"] = rc == 0
     report["duration_s"] = round(time.time() - started, 1)

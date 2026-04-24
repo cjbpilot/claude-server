@@ -1,23 +1,23 @@
 <#
 .SYNOPSIS
-    Installs the Claude Agent as a Windows service using NSSM.
+    Installs the Claude Agent as a Scheduled Task (at startup, run as SYSTEM).
 
 .DESCRIPTION
     - Stages the repo to $InstallDir (default C:\ClaudeAgent\app).
-    - Creates a venv at $VenvDir and installs deps + the agent package.
-    - Downloads NSSM if not already on PATH or $NssmPath.
-    - Registers the ClaudeAgent service to run 'python -m agent' under NSSM,
-      with auto-start, stdout/stderr log capture, and sensible restart rules.
-    - Removes any prior pywin32-based ClaudeAgent service first.
+    - Creates a venv and installs deps + the agent package.
+    - Seeds $ConfigDir\agent.toml and locks down $ConfigDir\nats.creds.
+    - Registers the 'ClaudeAgent' scheduled task:
+        Trigger  : At startup
+        Principal: SYSTEM, highest privileges
+        Action   : run-agent.cmd (wraps 'python -m agent' with log redirection)
+        Restart  : 99 retries, 1 min apart, execution time unlimited
+    - Removes any legacy NSSM service or prior scheduled task first.
 
 .PARAMETER CredsFile
     Path to the Synadia creds file (.creds). Required.
 
 .PARAMETER HostId
     Stable identifier for this machine. Required.
-
-.EXAMPLE
-    .\install-agent.ps1 -CredsFile C:\Temp\nats.creds -HostId my-desktop
 #>
 [CmdletBinding()]
 param(
@@ -29,8 +29,8 @@ param(
     [string]$WorkspaceDir = "C:\ClaudeAgent\workspace",
     [string]$ConfigDir    = "C:\ProgramData\ClaudeAgent",
     [string]$PythonExe    = "python",
-    [string]$ServiceName  = "ClaudeAgent",
-    [string]$NssmPath     = "C:\ClaudeAgent\nssm.exe"
+    [string]$TaskName     = "ClaudeAgent",
+    [string]$ServiceName  = "ClaudeAgent"
 )
 
 $ErrorActionPreference = "Stop"
@@ -50,7 +50,6 @@ function Ensure-Dir([string]$Path) {
 Require-Admin
 
 if (-not (Test-Path $CredsFile)) { throw "CredsFile not found: $CredsFile" }
-
 $CredsFile = (Resolve-Path $CredsFile).Path
 
 Write-Host "==> Preparing directories"
@@ -73,13 +72,8 @@ if (-not (Test-Path (Join-Path $InstallDir "agent\runner.py"))) {
 }
 
 # --- Ensure git checkout for self_update -----------------------------------
-Push-Location $InstallDir
-try {
-    if (-not (Test-Path (Join-Path $InstallDir ".git"))) {
-        Write-Warning "install dir is not a git checkout. self_update requires git; see SETUP.md step B6."
-    }
-} finally {
-    Pop-Location
+if (-not (Test-Path (Join-Path $InstallDir ".git"))) {
+    Write-Warning "install dir is not a git checkout. self_update requires git; see SETUP.md step B6."
 }
 
 # --- Create venv ------------------------------------------------------------
@@ -100,36 +94,20 @@ Write-Host "==> Installing agent package (editable)"
 & $venvPython -m pip install -e $InstallDir
 if ($LASTEXITCODE -ne 0) { throw "editable install failed" }
 
-# --- Ensure NSSM is available ----------------------------------------------
-function Get-NssmExe {
-    if (Test-Path $NssmPath) { return $NssmPath }
-    $cmd = Get-Command nssm.exe -ErrorAction SilentlyContinue
-    if ($cmd) { return $cmd.Source }
-    return $null
-}
-
-$nssmExe = Get-NssmExe
-if (-not $nssmExe) {
-    Write-Host "==> Downloading NSSM"
-    $zipUrl = "https://nssm.cc/release/nssm-2.24.zip"
-    $tmpZip = Join-Path $env:TEMP "nssm-2.24.zip"
-    $tmpDir = Join-Path $env:TEMP "nssm-2.24"
-
-    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-    Invoke-WebRequest -Uri $zipUrl -OutFile $tmpZip -UseBasicParsing
-
-    if (Test-Path $tmpDir) { Remove-Item -Recurse -Force $tmpDir }
-    Expand-Archive -Path $tmpZip -DestinationPath $tmpDir -Force
-
-    $arch = if ([Environment]::Is64BitOperatingSystem) { "win64" } else { "win32" }
-    $src  = Join-Path $tmpDir "nssm-2.24\$arch\nssm.exe"
-    if (-not (Test-Path $src)) { throw "nssm.exe not found in downloaded archive" }
-
-    Ensure-Dir (Split-Path $NssmPath -Parent)
-    Copy-Item -Force $src $NssmPath
-    $nssmExe = $NssmPath
-}
-Write-Host "==> Using NSSM at $nssmExe"
+# --- Generate the launcher wrapper with baked-in paths ---------------------
+$wrapper = Join-Path $InstallDir "run-agent.cmd"
+Write-Host "==> Writing launcher $wrapper"
+$wrapperContent = @"
+@echo off
+set "AGENT_PY=$venvPython"
+set "AGENT_DIR=$InstallDir"
+set "LOG_DIR=$(Join-Path $ConfigDir 'logs')"
+if not exist "%LOG_DIR%" mkdir "%LOG_DIR%"
+cd /d "%AGENT_DIR%"
+"%AGENT_PY%" -m agent 1>>"%LOG_DIR%\stdout.log" 2>>"%LOG_DIR%\stderr.log"
+exit /b %ERRORLEVEL%
+"@
+[System.IO.File]::WriteAllText($wrapper, $wrapperContent, [System.Text.ASCIIEncoding]::new())
 
 # --- Creds file -------------------------------------------------------------
 $credsDest = Join-Path $ConfigDir "nats.creds"
@@ -160,48 +138,50 @@ if (-not (Test-Path $cfgPath)) {
 
 # --- Remove any prior service (pywin32 or NSSM) ----------------------------
 if (Get-Service $ServiceName -ErrorAction SilentlyContinue) {
-    Write-Host "==> Removing existing $ServiceName service"
+    Write-Host "==> Removing legacy $ServiceName service"
     Stop-Service $ServiceName -Force -ErrorAction SilentlyContinue
-    & $nssmExe remove $ServiceName confirm 2>$null | Out-Null
+    $legacyNssm = "C:\ClaudeAgent\nssm.exe"
+    if (Test-Path $legacyNssm) {
+        & $legacyNssm remove $ServiceName confirm 2>$null | Out-Null
+    }
     if (Get-Service $ServiceName -ErrorAction SilentlyContinue) {
         sc.exe delete $ServiceName | Out-Null
     }
     Start-Sleep -Seconds 1
 }
 
-# --- Register the service via NSSM -----------------------------------------
-Write-Host "==> Registering service '$ServiceName' via NSSM"
-$stdoutLog = Join-Path $ConfigDir "logs\stdout.log"
-$stderrLog = Join-Path $ConfigDir "logs\stderr.log"
+# --- Remove any prior scheduled task ---------------------------------------
+if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
+    Write-Host "==> Removing existing scheduled task $TaskName"
+    Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
+}
 
-& $nssmExe install $ServiceName $venvPython "-m" "agent" | Out-Null
-& $nssmExe set $ServiceName AppDirectory          $InstallDir           | Out-Null
-& $nssmExe set $ServiceName DisplayName           "Claude Agent"        | Out-Null
-& $nssmExe set $ServiceName Description           "Remote control agent for Claude Code / Cowork." | Out-Null
-& $nssmExe set $ServiceName Start                 SERVICE_AUTO_START    | Out-Null
-& $nssmExe set $ServiceName AppStdout             $stdoutLog            | Out-Null
-& $nssmExe set $ServiceName AppStderr             $stderrLog            | Out-Null
-& $nssmExe set $ServiceName AppRotateFiles        1                     | Out-Null
-& $nssmExe set $ServiceName AppRotateOnline       1                     | Out-Null
-& $nssmExe set $ServiceName AppRotateBytes        10485760              | Out-Null
-& $nssmExe set $ServiceName AppStopMethodConsole  5000                  | Out-Null
-& $nssmExe set $ServiceName AppStopMethodWindow   5000                  | Out-Null
-& $nssmExe set $ServiceName AppStopMethodThreads  5000                  | Out-Null
-& $nssmExe set $ServiceName AppExit Default       Restart               | Out-Null
-& $nssmExe set $ServiceName AppExit 0             Exit                  | Out-Null
-& $nssmExe set $ServiceName AppThrottle           3000                  | Out-Null
-& $nssmExe set $ServiceName AppRestartDelay       2000                  | Out-Null
+# --- Register the scheduled task -------------------------------------------
+Write-Host "==> Registering scheduled task '$TaskName'"
 
-sc.exe failure $ServiceName reset= 86400 actions= restart/5000/restart/5000/restart/10000 | Out-Null
+$action   = New-ScheduledTaskAction -Execute $wrapper
+$trigger  = New-ScheduledTaskTrigger -AtStartup
+$settings = New-ScheduledTaskSettingsSet `
+    -AllowStartIfOnBatteries `
+    -DontStopIfGoingOnBatteries `
+    -StartWhenAvailable `
+    -RestartCount 99 `
+    -RestartInterval (New-TimeSpan -Minutes 1) `
+    -ExecutionTimeLimit ([TimeSpan]::Zero) `
+    -MultipleInstances IgnoreNew
+$principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
 
-Write-Host "==> Starting service"
-Start-Service -Name $ServiceName
-Start-Sleep -Seconds 2
-Get-Service -Name $ServiceName | Format-List Name, Status, StartType
+Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force | Out-Null
+
+Write-Host "==> Starting task"
+Start-ScheduledTask -TaskName $TaskName
+Start-Sleep -Seconds 3
+Get-ScheduledTask -TaskName $TaskName | Select-Object TaskName, State | Format-List
 
 Write-Host ""
 Write-Host "Install complete." -ForegroundColor Green
 Write-Host "  Edit $cfgPath to register your repos, deploys, and allowed services."
-Write-Host "  Restart after edits:   Restart-Service $ServiceName"
-Write-Host "  Agent log:             $ConfigDir\logs\agent.log"
-Write-Host "  NSSM stdout/stderr:    $stdoutLog / $stderrLog"
+Write-Host "  Restart after edits:  schtasks /End /TN $TaskName ; schtasks /Run /TN $TaskName"
+Write-Host "  Agent log:            $ConfigDir\logs\agent.log"
+Write-Host "  Wrapper stdout/err:   $ConfigDir\logs\stdout.log / stderr.log"

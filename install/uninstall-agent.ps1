@@ -1,17 +1,17 @@
 <#
 .SYNOPSIS
-    Removes the Claude Agent Windows service (NSSM-managed).
+    Removes the Claude Agent scheduled task (and any legacy NSSM service).
 
 .DESCRIPTION
-    Stops and removes the service. Leaves code, venv, config, and logs in
+    Stops and removes the task. Leaves code, venv, config, and logs in
     place by default. Pass -Purge to delete C:\ClaudeAgent and
     C:\ProgramData\ClaudeAgent too.
 #>
 [CmdletBinding()]
 param(
+    [string]$TaskName    = "ClaudeAgent",
     [string]$ServiceName = "ClaudeAgent",
     [string]$ConfigDir   = "C:\ProgramData\ClaudeAgent",
-    [string]$NssmPath    = "C:\ClaudeAgent\nssm.exe",
     [switch]$Purge
 )
 
@@ -23,28 +23,25 @@ if (-not $p.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrat
     throw "Run from an elevated PowerShell."
 }
 
-function Resolve-Nssm {
-    if (Test-Path $NssmPath) { return $NssmPath }
-    $cmd = Get-Command nssm.exe -ErrorAction SilentlyContinue
-    if ($cmd) { return $cmd.Source }
-    return $null
+if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
+    Write-Host "==> Stopping task $TaskName"
+    Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false
+    Write-Host "==> Task removed"
+} else {
+    Write-Host "task $TaskName not registered"
 }
 
-$nssmExe = Resolve-Nssm
-
 if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
-    Write-Host "==> Stopping $ServiceName"
+    Write-Host "==> Removing legacy $ServiceName service"
     Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
-
-    if ($nssmExe) {
-        & $nssmExe remove $ServiceName confirm | Out-Null
+    $legacyNssm = "C:\ClaudeAgent\nssm.exe"
+    if (Test-Path $legacyNssm) {
+        & $legacyNssm remove $ServiceName confirm | Out-Null
     }
     if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
         sc.exe delete $ServiceName | Out-Null
     }
-    Write-Host "==> Removed"
-} else {
-    Write-Host "service $ServiceName not installed"
 }
 
 if ($Purge) {
