@@ -204,15 +204,20 @@ def _install_sync_connect_shim() -> None:
     async def _patched(host=None, port=None, *, limit=2 ** 16, ssl=None,
                        sock=None, local_addr=None, server_hostname=None,
                        ssl_handshake_timeout=None, **kwargs):
+        log.info("shim: open_connection host=%r port=%r ssl=%s sock=%s sh=%r extra=%r",
+                 host, port, ssl is not None, sock, server_hostname, list(kwargs))
         if sock is not None or host is None or port is None:
+            log.info("shim: early-return path")
             return await _orig_open_connection(
                 host=host, port=port, limit=limit, ssl=ssl, sock=sock,
                 local_addr=local_addr, server_hostname=server_hostname,
                 ssl_handshake_timeout=ssl_handshake_timeout, **kwargs
             )
 
+        log.info("shim: sync-connect path")
         raw = _socket.create_connection((host, port))
         raw.setblocking(False)
+        log.info("shim: sync connected fd=%d peer=%r", raw.fileno(), raw.getpeername())
 
         kw: dict = {"sock": raw, "limit": limit}
         if ssl is not None:
