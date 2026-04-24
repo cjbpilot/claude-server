@@ -1,18 +1,17 @@
 <#
 .SYNOPSIS
-    Removes the Claude Agent Windows service.
+    Removes the Claude Agent Windows service (NSSM-managed).
 
 .DESCRIPTION
     Stops and removes the service. Leaves code, venv, config, and logs in
-    place by default so you can reinstall without losing state. Pass
-    -Purge to delete C:\ClaudeAgent and C:\ProgramData\ClaudeAgent too.
+    place by default. Pass -Purge to delete C:\ClaudeAgent and
+    C:\ProgramData\ClaudeAgent too.
 #>
 [CmdletBinding()]
 param(
     [string]$ServiceName = "ClaudeAgent",
-    [string]$InstallDir  = "C:\ClaudeAgent\app",
-    [string]$VenvDir     = "C:\ClaudeAgent\venv",
     [string]$ConfigDir   = "C:\ProgramData\ClaudeAgent",
+    [string]$NssmPath    = "C:\ClaudeAgent\nssm.exe",
     [switch]$Purge
 )
 
@@ -24,23 +23,26 @@ if (-not $p.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrat
     throw "Run from an elevated PowerShell."
 }
 
-$venvPython = Join-Path $VenvDir "Scripts\python.exe"
+function Resolve-Nssm {
+    if (Test-Path $NssmPath) { return $NssmPath }
+    $cmd = Get-Command nssm.exe -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+    return $null
+}
+
+$nssmExe = Resolve-Nssm
 
 if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
     Write-Host "==> Stopping $ServiceName"
     Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
 
-    $bootstrap = Join-Path $InstallDir "install_service.py"
-    if ((Test-Path $venvPython) -and (Test-Path $bootstrap)) {
-        Push-Location $InstallDir
-        try {
-            & $venvPython $bootstrap remove
-        } finally {
-            Pop-Location
-        }
-    } else {
+    if ($nssmExe) {
+        & $nssmExe remove $ServiceName confirm | Out-Null
+    }
+    if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
         sc.exe delete $ServiceName | Out-Null
     }
+    Write-Host "==> Removed"
 } else {
     Write-Host "service $ServiceName not installed"
 }

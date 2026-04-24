@@ -166,13 +166,37 @@ def _setup_logging() -> None:
 
 
 def main() -> int:
+    import signal
+
     _setup_logging()
     cfg = config.load()
-    runner = Runner(cfg)
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    agent = Runner(cfg)
+
+    def _on_signal(*_):
+        loop.call_soon_threadsafe(agent.request_stop, "signal")
+
+    signal.signal(signal.SIGINT, _on_signal)
+    sigbreak = getattr(signal, "SIGBREAK", None)
+    if sigbreak is not None:
+        signal.signal(sigbreak, _on_signal)
+    sigterm = getattr(signal, "SIGTERM", None)
+    if sigterm is not None:
+        try:
+            signal.signal(sigterm, _on_signal)
+        except (ValueError, OSError):
+            pass
+
     try:
-        asyncio.run(runner.run())
+        loop.run_until_complete(agent.run())
     except KeyboardInterrupt:
         pass
+    finally:
+        try:
+            loop.close()
+        except Exception:
+            pass
     return 0
 
 

@@ -1,46 +1,36 @@
 <#
 .SYNOPSIS
-    Installs the Claude Agent as a Windows service.
+    Installs the Claude Agent as a Windows service using NSSM.
 
 .DESCRIPTION
-    - Expects this script to live inside a clone of the claude-server repo.
-    - Clones/moves the repo to $InstallDir (default C:\ClaudeAgent\app).
-    - Creates a venv at C:\ClaudeAgent\venv.
-    - Installs Python requirements.
-    - Seeds C:\ProgramData\ClaudeAgent with agent.toml (if absent) and the
-      Synadia creds file you pass in.
-    - Registers the 'ClaudeAgent' Windows service with auto-start and
-      automatic restart on failure.
+    - Stages the repo to $InstallDir (default C:\ClaudeAgent\app).
+    - Creates a venv at $VenvDir and installs deps + the agent package.
+    - Downloads NSSM if not already on PATH or $NssmPath.
+    - Registers the ClaudeAgent service to run 'python -m agent' under NSSM,
+      with auto-start, stdout/stderr log capture, and sensible restart rules.
+    - Removes any prior pywin32-based ClaudeAgent service first.
 
 .PARAMETER CredsFile
-    Path to the Synadia Cloud creds file (.creds). Required.
+    Path to the Synadia creds file (.creds). Required.
 
 .PARAMETER HostId
     Stable identifier for this machine. Required.
 
-.PARAMETER NatsUrl
-    NATS URL. Default tls://connect.ngs.global (Synadia NGS).
-
-.PARAMETER InstallDir
-    Where the agent code lives. Default C:\ClaudeAgent\app.
-
-.PARAMETER PythonExe
-    Python interpreter used to create the venv. Default 'python'.
-
 .EXAMPLE
-    .\install-agent.ps1 -CredsFile C:\Users\me\Downloads\nats.creds -HostId my-desktop
+    .\install-agent.ps1 -CredsFile C:\Temp\nats.creds -HostId my-desktop
 #>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory=$true)][string]$CredsFile,
     [Parameter(Mandatory=$true)][string]$HostId,
-    [string]$NatsUrl = "tls://connect.ngs.global",
-    [string]$InstallDir = "C:\ClaudeAgent\app",
-    [string]$VenvDir = "C:\ClaudeAgent\venv",
+    [string]$NatsUrl      = "tls://connect.ngs.global",
+    [string]$InstallDir   = "C:\ClaudeAgent\app",
+    [string]$VenvDir      = "C:\ClaudeAgent\venv",
     [string]$WorkspaceDir = "C:\ClaudeAgent\workspace",
-    [string]$ConfigDir = "C:\ProgramData\ClaudeAgent",
-    [string]$PythonExe = "python",
-    [string]$ServiceName = "ClaudeAgent"
+    [string]$ConfigDir    = "C:\ProgramData\ClaudeAgent",
+    [string]$PythonExe    = "python",
+    [string]$ServiceName  = "ClaudeAgent",
+    [string]$NssmPath     = "C:\ClaudeAgent\nssm.exe"
 )
 
 $ErrorActionPreference = "Stop"
@@ -61,6 +51,8 @@ Require-Admin
 
 if (-not (Test-Path $CredsFile)) { throw "CredsFile not found: $CredsFile" }
 
+$CredsFile = (Resolve-Path $CredsFile).Path
+
 Write-Host "==> Preparing directories"
 Ensure-Dir (Split-Path $InstallDir -Parent)
 Ensure-Dir $WorkspaceDir
@@ -68,26 +60,23 @@ Ensure-Dir $ConfigDir
 Ensure-Dir (Join-Path $ConfigDir "logs")
 
 # --- Stage code -------------------------------------------------------------
-# This script lives in install/ inside the repo. Copy the repo to $InstallDir.
 $repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 Write-Host "==> Staging code from $repoRoot to $InstallDir"
 if (Test-Path $InstallDir) {
-    # Preserve .git if the user set it up already; otherwise just overwrite.
-    robocopy "$repoRoot" "$InstallDir" /MIR /XD ".venv" "__pycache__" /NFL /NDL /NJH /NJS | Out-Null
+    robocopy "$repoRoot" "$InstallDir" /MIR /XD ".venv" "__pycache__" ".git" /XF "*.creds" /NFL /NDL /NJH /NJS | Out-Null
 } else {
     Ensure-Dir $InstallDir
-    robocopy "$repoRoot" "$InstallDir" /E /XD ".venv" "__pycache__" /NFL /NDL /NJH /NJS | Out-Null
+    robocopy "$repoRoot" "$InstallDir" /E /XD ".venv" "__pycache__" /XF "*.creds" /NFL /NDL /NJH /NJS | Out-Null
 }
-if (-not (Test-Path (Join-Path $InstallDir "agent\service.py"))) {
-    throw "Staging failed - agent\service.py missing in $InstallDir."
+if (-not (Test-Path (Join-Path $InstallDir "agent\runner.py"))) {
+    throw "Staging failed - agent\runner.py missing in $InstallDir."
 }
 
-# --- Ensure the install dir is a git checkout so self_update works ----------
+# --- Ensure git checkout for self_update -----------------------------------
 Push-Location $InstallDir
 try {
     if (-not (Test-Path (Join-Path $InstallDir ".git"))) {
-        Write-Warning "install dir is not a git checkout. self_update requires git."
-        Write-Warning "Run 'git init && git remote add origin <url> && git fetch && git reset --hard origin/main' in $InstallDir, or re-stage from a git clone."
+        Write-Warning "install dir is not a git checkout. self_update requires git; see SETUP.md step B6."
     }
 } finally {
     Pop-Location
@@ -107,43 +96,49 @@ Write-Host "==> Installing agent requirements"
 & $venvPython -m pip install -r (Join-Path $InstallDir "agent\requirements.txt")
 if ($LASTEXITCODE -ne 0) { throw "pip install failed" }
 
-Write-Host "==> Installing agent package (editable) so the service can import it"
+Write-Host "==> Installing agent package (editable)"
 & $venvPython -m pip install -e $InstallDir
 if ($LASTEXITCODE -ne 0) { throw "editable install failed" }
 
-Write-Host "==> Running pywin32 postinstall (registers the service helper DLL)"
-$pywin32Post = Join-Path $VenvDir "Scripts\pywin32_postinstall.py"
-if (Test-Path $pywin32Post) {
-    & $venvPython $pywin32Post -install | Out-Null
-    if ($LASTEXITCODE -ne 0) { Write-Warning "pywin32_postinstall returned $LASTEXITCODE - the service may fail to start." }
-} else {
-    Write-Warning "pywin32_postinstall.py not found at $pywin32Post"
+# --- Ensure NSSM is available ----------------------------------------------
+function Get-NssmExe {
+    if (Test-Path $NssmPath) { return $NssmPath }
+    $cmd = Get-Command nssm.exe -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+    return $null
 }
 
-# pywin32 inside a venv registers the service with ImagePath pointing at
-# <venv>\pythonservice.exe, but the actual file ships in
-# <venv>\Lib\site-packages\win32\pythonservice.exe. Stage a copy where
-# pywin32 expects it so the registration line up matches the filesystem.
-$pyServiceSrc = Join-Path $VenvDir "Lib\site-packages\win32\pythonservice.exe"
-$pyServiceDst = Join-Path $VenvDir "pythonservice.exe"
-if (Test-Path $pyServiceSrc) {
-    Write-Host "==> Staging pythonservice.exe at $pyServiceDst"
-    Copy-Item -Force $pyServiceSrc $pyServiceDst
-} else {
-    Write-Warning "pythonservice.exe not found at $pyServiceSrc - service will fail to start."
+$nssmExe = Get-NssmExe
+if (-not $nssmExe) {
+    Write-Host "==> Downloading NSSM"
+    $zipUrl = "https://nssm.cc/release/nssm-2.24.zip"
+    $tmpZip = Join-Path $env:TEMP "nssm-2.24.zip"
+    $tmpDir = Join-Path $env:TEMP "nssm-2.24"
+
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+    Invoke-WebRequest -Uri $zipUrl -OutFile $tmpZip -UseBasicParsing
+
+    if (Test-Path $tmpDir) { Remove-Item -Recurse -Force $tmpDir }
+    Expand-Archive -Path $tmpZip -DestinationPath $tmpDir -Force
+
+    $arch = if ([Environment]::Is64BitOperatingSystem) { "win64" } else { "win32" }
+    $src  = Join-Path $tmpDir "nssm-2.24\$arch\nssm.exe"
+    if (-not (Test-Path $src)) { throw "nssm.exe not found in downloaded archive" }
+
+    Ensure-Dir (Split-Path $NssmPath -Parent)
+    Copy-Item -Force $src $NssmPath
+    $nssmExe = $NssmPath
 }
+Write-Host "==> Using NSSM at $nssmExe"
 
 # --- Creds file -------------------------------------------------------------
 $credsDest = Join-Path $ConfigDir "nats.creds"
 Write-Host "==> Installing creds to $credsDest"
 if (Test-Path $credsDest) {
-    # Previous installs locked the ACL so even Administrators can't overwrite.
-    # Restore full control, then delete so Copy-Item has a clean target.
     icacls $credsDest /grant "Administrators:F" | Out-Null
     Remove-Item -Force $credsDest
 }
 Copy-Item -Force $CredsFile $credsDest
-# Re-lock: read-only for SYSTEM + Administrators, no inheritance.
 icacls $credsDest /inheritance:r /grant "SYSTEM:R" "Administrators:R" | Out-Null
 
 # --- agent.toml -------------------------------------------------------------
@@ -152,48 +147,61 @@ if (-not (Test-Path $cfgPath)) {
     Write-Host "==> Seeding $cfgPath from agent.toml.example"
     $example = Get-Content (Join-Path $InstallDir "agent\agent.toml.example") -Raw
     $example = $example `
-        -replace 'host_id = "my-desktop"',            ("host_id = `"" + $HostId + "`"") `
-        -replace 'C:/ClaudeAgent/workspace',           ($WorkspaceDir.Replace('\','/')) `
-        -replace 'C:/ClaudeAgent/app',                 ($InstallDir.Replace('\','/')) `
+        -replace 'host_id = "my-desktop"',              ("host_id = `"" + $HostId + "`"") `
+        -replace 'C:/ClaudeAgent/workspace',             ($WorkspaceDir.Replace('\','/')) `
+        -replace 'C:/ClaudeAgent/app',                   ($InstallDir.Replace('\','/')) `
         -replace 'C:/ClaudeAgent/venv/Scripts/python.exe', ($venvPython.Replace('\','/')) `
-        -replace 'C:/ProgramData/ClaudeAgent/nats.creds',   ($credsDest.Replace('\','/')) `
-        -replace 'tls://connect.ngs.global',           $NatsUrl
+        -replace 'C:/ProgramData/ClaudeAgent/nats.creds',  ($credsDest.Replace('\','/')) `
+        -replace 'tls://connect.ngs.global',             $NatsUrl
     Set-Content -Path $cfgPath -Value $example -Encoding UTF8
 } else {
     Write-Host "==> Keeping existing $cfgPath"
 }
 
-# --- Install / update the Windows service -----------------------------------
-Write-Host "==> Registering Windows service '$ServiceName'"
-
-# Use the bootstrap script so pywin32 stores the class with its full module
-# name (agent.service.ClaudeAgentService), not '__main__.ClaudeAgentService'.
-$bootstrap = Join-Path $InstallDir "install_service.py"
-if (-not (Test-Path $bootstrap)) { throw "install_service.py missing at $bootstrap" }
-
-Push-Location $InstallDir
-try {
-    # Remove any old copy so we can re-register cleanly.
-    & $venvPython $bootstrap stop 2>$null
-    & $venvPython $bootstrap remove 2>$null
-
-    & $venvPython $bootstrap --startup=auto install
-    if ($LASTEXITCODE -ne 0) { throw "service install failed" }
-} finally {
-    Pop-Location
+# --- Remove any prior service (pywin32 or NSSM) ----------------------------
+if (Get-Service $ServiceName -ErrorAction SilentlyContinue) {
+    Write-Host "==> Removing existing $ServiceName service"
+    Stop-Service $ServiceName -Force -ErrorAction SilentlyContinue
+    & $nssmExe remove $ServiceName confirm 2>$null | Out-Null
+    if (Get-Service $ServiceName -ErrorAction SilentlyContinue) {
+        sc.exe delete $ServiceName | Out-Null
+    }
+    Start-Sleep -Seconds 1
 }
 
-# Configure recovery: restart after 5s on any failure.
+# --- Register the service via NSSM -----------------------------------------
+Write-Host "==> Registering service '$ServiceName' via NSSM"
+$stdoutLog = Join-Path $ConfigDir "logs\stdout.log"
+$stderrLog = Join-Path $ConfigDir "logs\stderr.log"
+
+& $nssmExe install $ServiceName $venvPython "-m" "agent" | Out-Null
+& $nssmExe set $ServiceName AppDirectory          $InstallDir           | Out-Null
+& $nssmExe set $ServiceName DisplayName           "Claude Agent"        | Out-Null
+& $nssmExe set $ServiceName Description           "Remote control agent for Claude Code / Cowork." | Out-Null
+& $nssmExe set $ServiceName Start                 SERVICE_AUTO_START    | Out-Null
+& $nssmExe set $ServiceName AppStdout             $stdoutLog            | Out-Null
+& $nssmExe set $ServiceName AppStderr             $stderrLog            | Out-Null
+& $nssmExe set $ServiceName AppRotateFiles        1                     | Out-Null
+& $nssmExe set $ServiceName AppRotateOnline       1                     | Out-Null
+& $nssmExe set $ServiceName AppRotateBytes        10485760              | Out-Null
+& $nssmExe set $ServiceName AppStopMethodConsole  5000                  | Out-Null
+& $nssmExe set $ServiceName AppStopMethodWindow   5000                  | Out-Null
+& $nssmExe set $ServiceName AppStopMethodThreads  5000                  | Out-Null
+& $nssmExe set $ServiceName AppExit Default       Restart               | Out-Null
+& $nssmExe set $ServiceName AppExit 0             Exit                  | Out-Null
+& $nssmExe set $ServiceName AppThrottle           3000                  | Out-Null
+& $nssmExe set $ServiceName AppRestartDelay       2000                  | Out-Null
+
 sc.exe failure $ServiceName reset= 86400 actions= restart/5000/restart/5000/restart/10000 | Out-Null
-# Give it a friendly description.
-sc.exe description $ServiceName "Claude Agent - remote control for Claude Code / Cowork." | Out-Null
 
 Write-Host "==> Starting service"
 Start-Service -Name $ServiceName
+Start-Sleep -Seconds 2
 Get-Service -Name $ServiceName | Format-List Name, Status, StartType
 
 Write-Host ""
-Write-Host "Install complete. Next steps:" -ForegroundColor Green
-Write-Host "  - Edit $cfgPath to register your repos, deploys, and allowed services."
-Write-Host "  - Restart the service after config changes:  Restart-Service $ServiceName"
-Write-Host "  - Logs: $ConfigDir\logs\agent.log"
+Write-Host "Install complete." -ForegroundColor Green
+Write-Host "  Edit $cfgPath to register your repos, deploys, and allowed services."
+Write-Host "  Restart after edits:   Restart-Service $ServiceName"
+Write-Host "  Agent log:             $ConfigDir\logs\agent.log"
+Write-Host "  NSSM stdout/stderr:    $stdoutLog / $stderrLog"

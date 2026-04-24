@@ -81,11 +81,14 @@ What this does:
 
 - Copies the repo to `C:\ClaudeAgent\app`.
 - Creates a Python venv at `C:\ClaudeAgent\venv`.
-- Installs dependencies.
+- Installs dependencies and the agent package (editable).
+- Downloads NSSM (<https://nssm.cc>) to `C:\ClaudeAgent\nssm.exe` if it's
+  not already installed.
 - Seeds `C:\ProgramData\ClaudeAgent\agent.toml` from the example and locks
   down `nats.creds` so only SYSTEM/Admins can read it.
-- Registers the `ClaudeAgent` Windows service (auto-start, restart on
-  failure) and starts it.
+- Registers the `ClaudeAgent` service via NSSM: auto-start, restart on
+  crash, stdout/stderr capture with rotation, graceful stop via Ctrl+C.
+- Starts the service.
 
 Check it's running:
 
