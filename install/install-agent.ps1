@@ -120,6 +120,19 @@ if (Test-Path $pywin32Post) {
     Write-Warning "pywin32_postinstall.py not found at $pywin32Post"
 }
 
+# pywin32 inside a venv registers the service with ImagePath pointing at
+# <venv>\pythonservice.exe, but the actual file ships in
+# <venv>\Lib\site-packages\win32\pythonservice.exe. Stage a copy where
+# pywin32 expects it so the registration line up matches the filesystem.
+$pyServiceSrc = Join-Path $VenvDir "Lib\site-packages\win32\pythonservice.exe"
+$pyServiceDst = Join-Path $VenvDir "pythonservice.exe"
+if (Test-Path $pyServiceSrc) {
+    Write-Host "==> Staging pythonservice.exe at $pyServiceDst"
+    Copy-Item -Force $pyServiceSrc $pyServiceDst
+} else {
+    Write-Warning "pythonservice.exe not found at $pyServiceSrc - service will fail to start."
+}
+
 # --- Creds file -------------------------------------------------------------
 $credsDest = Join-Path $ConfigDir "nats.creds"
 Write-Host "==> Installing creds to $credsDest"
