@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "claude-agent"
+version = "0.1.0"
+description = "Remote control agent for a Windows desktop driven by Claude Code via NATS."
+requires-python = ">=3.11"
+dependencies = [
+    "nats-py>=2.9.0",
+    "psutil>=5.9.0",
+    "httpx>=0.27.0",
+    "pywin32>=306; sys_platform == 'win32'",
+]
+
+[tool.setuptools]
+packages = ["agent", "agent.handlers", "shared", "mcp_plugin"]

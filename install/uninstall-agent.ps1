@@ -30,11 +30,11 @@ if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
     Write-Host "==> Stopping $ServiceName"
     Stop-Service -Name $ServiceName -Force -ErrorAction SilentlyContinue
 
-    if (Test-Path $venvPython) {
+    $bootstrap = Join-Path $InstallDir "install_service.py"
+    if ((Test-Path $venvPython) -and (Test-Path $bootstrap)) {
         Push-Location $InstallDir
         try {
-            $env:PYTHONPATH = $InstallDir
-            & $venvPython -m agent.service remove
+            & $venvPython $bootstrap remove
         } finally {
             Pop-Location
         }

@@ -107,6 +107,19 @@ Write-Host "==> Installing agent requirements"
 & $venvPython -m pip install -r (Join-Path $InstallDir "agent\requirements.txt")
 if ($LASTEXITCODE -ne 0) { throw "pip install failed" }
 
+Write-Host "==> Installing agent package (editable) so the service can import it"
+& $venvPython -m pip install -e $InstallDir
+if ($LASTEXITCODE -ne 0) { throw "editable install failed" }
+
+Write-Host "==> Running pywin32 postinstall (registers the service helper DLL)"
+$pywin32Post = Join-Path $VenvDir "Scripts\pywin32_postinstall.py"
+if (Test-Path $pywin32Post) {
+    & $venvPython $pywin32Post -install | Out-Null
+    if ($LASTEXITCODE -ne 0) { Write-Warning "pywin32_postinstall returned $LASTEXITCODE - the service may fail to start." }
+} else {
+    Write-Warning "pywin32_postinstall.py not found at $pywin32Post"
+}
+
 # --- Creds file -------------------------------------------------------------
 $credsDest = Join-Path $ConfigDir "nats.creds"
 Write-Host "==> Installing creds to $credsDest"
@@ -134,15 +147,18 @@ if (-not (Test-Path $cfgPath)) {
 # --- Install / update the Windows service -----------------------------------
 Write-Host "==> Registering Windows service '$ServiceName'"
 
-# pywin32 service registration must be run with the agent importable on sys.path.
-$env:PYTHONPATH = $InstallDir
+# Use the bootstrap script so pywin32 stores the class with its full module
+# name (agent.service.ClaudeAgentService), not '__main__.ClaudeAgentService'.
+$bootstrap = Join-Path $InstallDir "install_service.py"
+if (-not (Test-Path $bootstrap)) { throw "install_service.py missing at $bootstrap" }
+
 Push-Location $InstallDir
 try {
-    # Remove any old copy so we can re-register cleanly with the new --startup arg.
-    & $venvPython -m agent.service stop 2>$null
-    & $venvPython -m agent.service remove 2>$null
+    # Remove any old copy so we can re-register cleanly.
+    & $venvPython $bootstrap stop 2>$null
+    & $venvPython $bootstrap remove 2>$null
 
-    & $venvPython -m agent.service --startup=auto install
+    & $venvPython $bootstrap --startup=auto install
     if ($LASTEXITCODE -ne 0) { throw "service install failed" }
 } finally {
     Pop-Location
