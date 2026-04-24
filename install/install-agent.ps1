@@ -79,7 +79,7 @@ if (Test-Path $InstallDir) {
     robocopy "$repoRoot" "$InstallDir" /E /XD ".venv" "__pycache__" /NFL /NDL /NJH /NJS | Out-Null
 }
 if (-not (Test-Path (Join-Path $InstallDir "agent\service.py"))) {
-    throw "Staging failed — agent\service.py missing in $InstallDir."
+    throw "Staging failed - agent\service.py missing in $InstallDir."
 }
 
 # --- Ensure the install dir is a git checkout so self_update works ----------
@@ -151,7 +151,7 @@ try {
 # Configure recovery: restart after 5s on any failure.
 sc.exe failure $ServiceName reset= 86400 actions= restart/5000/restart/5000/restart/10000 | Out-Null
 # Give it a friendly description.
-sc.exe description $ServiceName "Claude Agent — remote control for Claude Code / Cowork." | Out-Null
+sc.exe description $ServiceName "Claude Agent - remote control for Claude Code / Cowork." | Out-Null
 
 Write-Host "==> Starting service"
 Start-Service -Name $ServiceName

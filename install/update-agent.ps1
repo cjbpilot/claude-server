@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Manual update helper — does the same thing the self_update MCP tool does.
+    Manual update helper - does the same thing the self_update MCP tool does.
 
 .DESCRIPTION
     Useful when self_update can't run (service stopped, NATS unreachable, etc).
