@@ -29,8 +29,9 @@ heartbeat_s = 10
 # Path to Synadia Cloud creds file (NATS context NKey/JWT).
 creds_file = "C:/ProgramData/ClaudeAgent/nats.creds"
 
-# NATS server URL from Synadia Cloud (tls://connect.ngs.global for Synadia NGS).
-url = "tls://connect.ngs.global"
+# NATS server URL from Synadia Cloud. Port is REQUIRED - nats-py doesn't
+# default it and passing port=None upstream triggers WinError 10049.
+url = "tls://connect.ngs.global:4222"
 
 [ollama]
 # Ollama HTTP API. Default install is fine.

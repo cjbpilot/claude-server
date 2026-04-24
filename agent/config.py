@@ -81,6 +81,13 @@ def load(path: Path | None = None) -> Config:
     }
     allowed_services = [s["name"] for s in raw.get("allowed_services", [])]
 
+    nats_url = nats["url"]
+    if "://" in nats_url:
+        scheme, rest = nats_url.split("://", 1)
+        host_part = rest.split("/", 1)[0]
+        if ":" not in host_part:
+            nats_url = f"{scheme}://{host_part}:4222" + nats_url[len(scheme) + 3 + len(host_part):]
+
     return Config(
         host_id=agent["host_id"],
         workspace_dir=Path(agent["workspace_dir"]),
@@ -88,7 +95,7 @@ def load(path: Path | None = None) -> Config:
         python_exe=Path(agent["python_exe"]),
         service_name=agent.get("service_name", "ClaudeAgent"),
         heartbeat_s=int(agent.get("heartbeat_s", 10)),
-        nats_url=nats["url"],
+        nats_url=nats_url,
         nats_creds=Path(nats["creds_file"]),
         ollama_url=ollama.get("url", "http://127.0.0.1:11434"),
         repos=repos,
