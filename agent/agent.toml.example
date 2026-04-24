@@ -1,0 +1,54 @@
+# Claude Agent config.
+# Copy to agent.toml and fill in your values.
+# Location on Windows: C:\ProgramData\ClaudeAgent\agent.toml
+
+[agent]
+# Stable identifier for this machine. Used as the <host> segment in all NATS
+# subjects. Keep short and URL-safe: a-z, 0-9, dash.
+host_id = "my-desktop"
+
+# Directory where repos are cloned and deploys run.
+workspace_dir = "C:/ClaudeAgent/workspace"
+
+# Where the agent's own git checkout lives (used by self_update).
+# This is the directory containing the `agent/` and `shared/` folders.
+install_dir = "C:/ClaudeAgent/app"
+
+# Python executable inside the agent's venv. Used by self_update to reinstall
+# dependencies after a git pull.
+python_exe = "C:/ClaudeAgent/venv/Scripts/python.exe"
+
+# Windows service name. Must match install-agent.ps1.
+service_name = "ClaudeAgent"
+
+# Heartbeat interval in seconds.
+heartbeat_s = 10
+
+[nats]
+# Path to Synadia Cloud creds file (NATS context NKey/JWT).
+creds_file = "C:/ProgramData/ClaudeAgent/nats.creds"
+
+# NATS server URL from Synadia Cloud (tls://connect.ngs.global for Synadia NGS).
+url = "tls://connect.ngs.global"
+
+[ollama]
+# Ollama HTTP API. Default install is fine.
+url = "http://127.0.0.1:11434"
+
+# Allowed registered repos. The MCP plugin can only git_pull these.
+# name -> { path, remote }. Path is relative to workspace_dir or absolute.
+[repos.example-app]
+path = "example-app"
+remote = "https://github.com/you/example-app.git"
+branch = "main"
+
+# Allowed deploy scripts. The MCP plugin can only run_deploy these by name.
+# Each one runs `cmd` in `cwd` (resolved against workspace_dir if relative).
+[deploys.example-app-deploy]
+cwd = "example-app"
+cmd = "pwsh -NoProfile -ExecutionPolicy Bypass -File ./deploy.ps1"
+timeout_s = 600
+
+# Allowed Windows services that service_restart can touch.
+[[allowed_services]]
+name = "Ollama"
