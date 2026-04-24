@@ -226,7 +226,14 @@ def _install_sync_connect_shim() -> None:
         if ssl_handshake_timeout is not None:
             kw["ssl_handshake_timeout"] = ssl_handshake_timeout
         kw.update(kwargs)
-        return await _orig_open_connection(**kw)
+        log.info("shim: handing off to asyncio with keys=%r", list(kw.keys()))
+        try:
+            result = await _orig_open_connection(**kw)
+        except BaseException:
+            log.exception("shim: asyncio handoff raised")
+            raise
+        log.info("shim: handoff succeeded")
+        return result
 
     _asyncio.open_connection = _patched
 
