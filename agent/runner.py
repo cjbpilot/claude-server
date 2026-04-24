@@ -166,14 +166,7 @@ def _setup_logging() -> None:
 
 
 def _prefer_ipv4_on_windows() -> None:
-    """Work around asyncio ProactorEventLoop + no-IPv6 hosts.
-
-    On Windows, ConnectEx requires pre-binding the socket. If DNS returns an
-    AAAA record first and the machine has no usable IPv6, the bind to
-    ('::', 0) raises WinError 10049 and the fallback to IPv4 doesn't
-    always kick in cleanly. Filter DNS results so IPv4 comes first (or is
-    the only option) for this process.
-    """
+    """Filter DNS results to prefer IPv4 on Windows."""
     if sys.platform != "win32":
         return
     import socket as _socket
@@ -188,11 +181,57 @@ def _prefer_ipv4_on_windows() -> None:
     _socket.getaddrinfo = _patched
 
 
+def _install_sync_connect_shim() -> None:
+    """Avoid asyncio ProactorEventLoop ConnectEx failures in session-0.
+
+    On Windows, running in a SYSTEM service / scheduled-task context,
+    asyncio.open_connection with ssl= consistently fails during ConnectEx
+    with WinError 10049 on some machines - even when a plain synchronous
+    socket.connect to the same host:port from the same process succeeds.
+
+    Work around it by doing the TCP connect synchronously with the stdlib
+    socket module, then handing the already-connected socket to asyncio
+    with sock= + ssl= so asyncio only drives the TLS handshake. The exact
+    same code path as direct asyncio otherwise.
+    """
+    if sys.platform != "win32":
+        return
+    import asyncio as _asyncio
+    import socket as _socket
+
+    _orig_open_connection = _asyncio.open_connection
+
+    async def _patched(host=None, port=None, *, limit=2 ** 16, ssl=None,
+                       sock=None, local_addr=None, server_hostname=None,
+                       ssl_handshake_timeout=None, **kwargs):
+        if sock is not None or host is None or port is None:
+            return await _orig_open_connection(
+                host=host, port=port, limit=limit, ssl=ssl, sock=sock,
+                local_addr=local_addr, server_hostname=server_hostname,
+                ssl_handshake_timeout=ssl_handshake_timeout, **kwargs
+            )
+
+        raw = _socket.create_connection((host, port))
+        raw.setblocking(False)
+
+        kw: dict = {"sock": raw, "limit": limit}
+        if ssl is not None:
+            kw["ssl"] = ssl
+            kw["server_hostname"] = server_hostname or host
+        if ssl_handshake_timeout is not None:
+            kw["ssl_handshake_timeout"] = ssl_handshake_timeout
+        kw.update(kwargs)
+        return await _orig_open_connection(**kw)
+
+    _asyncio.open_connection = _patched
+
+
 def main() -> int:
     import signal
 
     _setup_logging()
     _prefer_ipv4_on_windows()
+    _install_sync_connect_shim()
     cfg = config.load()
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
