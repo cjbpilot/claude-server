@@ -127,6 +127,7 @@ class Runner:
             reconnect_time_wait=2,
         )
         try:
+            log.info("NATS connected - agent %s online as host=%s", __version__, self.cfg.host_id)
             await self._publish_event("started", f"agent {__version__} online")
             await self._announce_update_report()
 
