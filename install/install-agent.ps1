@@ -123,8 +123,14 @@ if (Test-Path $pywin32Post) {
 # --- Creds file -------------------------------------------------------------
 $credsDest = Join-Path $ConfigDir "nats.creds"
 Write-Host "==> Installing creds to $credsDest"
+if (Test-Path $credsDest) {
+    # Previous installs locked the ACL so even Administrators can't overwrite.
+    # Restore full control, then delete so Copy-Item has a clean target.
+    icacls $credsDest /grant "Administrators:F" | Out-Null
+    Remove-Item -Force $credsDest
+}
 Copy-Item -Force $CredsFile $credsDest
-# Lock ACL to SYSTEM + Administrators.
+# Re-lock: read-only for SYSTEM + Administrators, no inheritance.
 icacls $credsDest /inheritance:r /grant "SYSTEM:R" "Administrators:R" | Out-Null
 
 # --- agent.toml -------------------------------------------------------------
