@@ -60,8 +60,12 @@ def load(path: Path | None = None) -> Config:
     if not config_path.exists():
         raise FileNotFoundError(f"agent config not found: {config_path}")
 
-    with config_path.open("rb") as f:
-        raw: dict[str, Any] = tomllib.load(f)
+    # Strip UTF-8 BOM if present - PowerShell 5.1 Set-Content -Encoding UTF8
+    # writes one by default and Python 3.11.0 tomllib rejects it.
+    data = config_path.read_bytes()
+    if data.startswith(b"\xef\xbb\xbf"):
+        data = data[3:]
+    raw: dict[str, Any] = tomllib.loads(data.decode("utf-8"))
 
     agent = raw.get("agent", {})
     nats = raw.get("nats", {})

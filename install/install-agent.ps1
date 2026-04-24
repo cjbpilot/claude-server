@@ -153,7 +153,7 @@ if (-not (Test-Path $cfgPath)) {
         -replace 'C:/ClaudeAgent/venv/Scripts/python.exe', ($venvPython.Replace('\','/')) `
         -replace 'C:/ProgramData/ClaudeAgent/nats.creds',  ($credsDest.Replace('\','/')) `
         -replace 'tls://connect.ngs.global',             $NatsUrl
-    Set-Content -Path $cfgPath -Value $example -Encoding UTF8
+    [System.IO.File]::WriteAllText($cfgPath, $example, [System.Text.UTF8Encoding]::new($false))
 } else {
     Write-Host "==> Keeping existing $cfgPath"
 }
