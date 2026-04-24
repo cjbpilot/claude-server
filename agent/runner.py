@@ -165,10 +165,34 @@ def _setup_logging() -> None:
     root.addHandler(handler)
 
 
+def _prefer_ipv4_on_windows() -> None:
+    """Work around asyncio ProactorEventLoop + no-IPv6 hosts.
+
+    On Windows, ConnectEx requires pre-binding the socket. If DNS returns an
+    AAAA record first and the machine has no usable IPv6, the bind to
+    ('::', 0) raises WinError 10049 and the fallback to IPv4 doesn't
+    always kick in cleanly. Filter DNS results so IPv4 comes first (or is
+    the only option) for this process.
+    """
+    if sys.platform != "win32":
+        return
+    import socket as _socket
+
+    _orig = _socket.getaddrinfo
+
+    def _patched(host, port, family=0, type=0, proto=0, flags=0):
+        results = _orig(host, port, family, type, proto, flags)
+        v4 = [r for r in results if r[0] == _socket.AF_INET]
+        return v4 or results
+
+    _socket.getaddrinfo = _patched
+
+
 def main() -> int:
     import signal
 
     _setup_logging()
+    _prefer_ipv4_on_windows()
     cfg = config.load()
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
