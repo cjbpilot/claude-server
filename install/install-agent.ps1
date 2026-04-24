@@ -23,7 +23,7 @@
 param(
     [Parameter(Mandatory=$true)][string]$CredsFile,
     [Parameter(Mandatory=$true)][string]$HostId,
-    [string]$NatsUrl      = "tls://connect.ngs.global:4222",
+    [string]$NatsUrl      = "wss://connect.ngs.global:443",
     [string]$InstallDir   = "C:\ClaudeAgent\app",
     [string]$VenvDir      = "C:\ClaudeAgent\venv",
     [string]$WorkspaceDir = "C:\ClaudeAgent\workspace",

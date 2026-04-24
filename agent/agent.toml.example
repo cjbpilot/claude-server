@@ -29,9 +29,11 @@ heartbeat_s = 10
 # Path to Synadia Cloud creds file (NATS context NKey/JWT).
 creds_file = "C:/ProgramData/ClaudeAgent/nats.creds"
 
-# NATS server URL from Synadia Cloud. Port is REQUIRED - nats-py doesn't
-# default it and passing port=None upstream triggers WinError 10049.
-url = "tls://connect.ngs.global:4222"
+# NATS URL. Use wss:// on Windows - native tls:// hits asyncio+session-0
+# issues (WinError 10049 on ConnectEx) and silent hangs during TLS upgrade.
+# wss:// routes through the websockets library over HTTPS/443 and works
+# everywhere.
+url = "wss://connect.ngs.global:443"
 
 [ollama]
 # Ollama HTTP API. Default install is fine.

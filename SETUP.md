@@ -22,14 +22,14 @@ Work top to bottom the first time.
    contains a JWT + NKey seed. **Treat it like a password.**
 5. Note the NATS URL. For Synadia NGS this is:
 
-       tls://connect.ngs.global
+       wss://connect.ngs.global:443
 
    (If you're using a different NATS host, use its URL.)
 
 You now have two things to carry to the other steps:
 
 - `claude-agent.creds`
-- `tls://connect.ngs.global`
+- `wss://connect.ngs.global:443`
 
 ---
 
@@ -75,7 +75,7 @@ Still in an elevated PowerShell, from the repo root:
     .\install\install-agent.ps1 `
         -CredsFile C:\Temp\nats.creds `
         -HostId    my-desktop `
-        -NatsUrl   tls://connect.ngs.global
+        -NatsUrl   wss://connect.ngs.global:443
 
 What this does:
 
@@ -95,7 +95,7 @@ Check it's running:
 
 You should see a line like:
 
-    connecting to tls://connect.ngs.global as host=my-desktop version=0.1.0
+    connecting to wss://connect.ngs.global:443 as host=my-desktop version=0.1.0
 
 ### B5. Configure what the agent is allowed to touch
 
@@ -187,7 +187,7 @@ From the `claude-server` directory:
 
     claude mcp add claude-agent \
         -e CLAUDE_AGENT_HOST_ID=my-desktop \
-        -e CLAUDE_AGENT_NATS_URL=tls://connect.ngs.global \
+        -e CLAUDE_AGENT_NATS_URL=wss://connect.ngs.global:443 \
         -e CLAUDE_AGENT_CREDS=$HOME/.config/claude-agent/nats.creds \
         -- $PWD/.venv/bin/python -m mcp_plugin.server
 
