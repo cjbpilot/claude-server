@@ -121,9 +121,9 @@ def main() -> int:
         write_report(report)
         run_task()
         return 1
-
-    rc, out = run(["git", "clean", "-fd"], cwd=install_dir)
-    step("git_clean", rc, out)
+    # Note: deliberately NOT running 'git clean'. Install-time artifacts
+    # (run-agent.cmd, claude_agent.egg-info/) live in this directory and
+    # are untracked by design - cleaning them out kills the task launcher.
 
     rc_post, post_rev = run(["git", "rev-parse", "HEAD"], cwd=install_dir)
     post_rev = post_rev.strip()
