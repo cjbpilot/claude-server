@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import time
@@ -39,15 +40,20 @@ def wait_for_pid_exit(pid: int, timeout_s: int = 60) -> bool:
 
 def run(cmd: list[str], cwd: str, timeout: int = 600) -> tuple[int, str]:
     log(f"$ {' '.join(cmd)}  (cwd={cwd})")
+    env = os.environ.copy()
+    # Stop git from hanging on a credential prompt that no one is there to answer.
+    env.setdefault("GIT_TERMINAL_PROMPT", "0")
+    env.setdefault("GIT_ASKPASS", "echo")
     try:
         out = subprocess.run(
-            cmd, cwd=cwd, timeout=timeout, capture_output=True, text=True
+            cmd, cwd=cwd, timeout=timeout, capture_output=True, text=True, env=env
         )
         log(out.stdout.strip())
         if out.stderr:
             log(f"stderr: {out.stderr.strip()}")
         return out.returncode, (out.stdout + out.stderr)
     except subprocess.TimeoutExpired:
+        log(f"timeout after {timeout}s")
         return 124, "timeout"
 
 
@@ -96,10 +102,10 @@ def main() -> int:
     pre_rev = pre_rev.strip()
     step("pre_rev", rc_rev, pre_rev)
 
-    rc, out = run(["git", "fetch", "--all", "--prune"], cwd=install_dir)
+    rc, out = run(["git", "fetch", "--all", "--prune"], cwd=install_dir, timeout=120)
     step("git_fetch", rc, out)
     if rc != 0:
-        report["error"] = "git fetch failed"
+        report["error"] = f"git fetch failed (rc={rc}); often means SYSTEM has no creds for a private repo"
         write_report(report)
         run_task()
         return 1
