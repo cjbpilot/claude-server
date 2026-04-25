@@ -104,13 +104,20 @@ def main() -> int:
         run_task()
         return 1
 
-    rc, out = run(["git", "pull", "--ff-only"], cwd=install_dir)
-    step("git_pull", rc, out)
+    rc_branch, branch = run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=install_dir)
+    branch = branch.strip() or "main"
+    step("branch", rc_branch, branch)
+
+    rc, out = run(["git", "reset", "--hard", f"origin/{branch}"], cwd=install_dir)
+    step("git_reset", rc, out)
     if rc != 0:
-        report["error"] = "git pull failed (not fast-forward?)"
+        report["error"] = f"git reset --hard origin/{branch} failed"
         write_report(report)
         run_task()
         return 1
+
+    rc, out = run(["git", "clean", "-fd"], cwd=install_dir)
+    step("git_clean", rc, out)
 
     rc_post, post_rev = run(["git", "rev-parse", "HEAD"], cwd=install_dir)
     post_rev = post_rev.strip()

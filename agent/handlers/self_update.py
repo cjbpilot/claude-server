@@ -55,6 +55,13 @@ async def handle_self_update(hctx, cmd: Command) -> Reply:
         "--job-id", job_id,
     ]
 
+    log_path = Path(r"C:\ProgramData\ClaudeAgent\logs\updater.log")
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_fh = open(log_path, "ab")
+    except Exception as e:
+        return Reply(id=cmd.id, ok=False, error=f"could not open updater log: {e!r}")
+
     try:
         subprocess.Popen(
             args,
@@ -65,12 +72,15 @@ async def handle_self_update(hctx, cmd: Command) -> Reply:
                 else 0
             ),
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=log_fh,
+            stderr=subprocess.STDOUT,
             close_fds=True,
         )
     except Exception as e:
+        log_fh.close()
         return Reply(id=cmd.id, ok=False, error=f"failed to spawn updater: {e!r}")
+    finally:
+        log_fh.close()
 
     # Ask the runner to stop. The Windows service manager will restart us
     # because install-agent.ps1 sets SERVICE_AUTO_START with failure actions.
