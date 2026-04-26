@@ -218,6 +218,49 @@ async def host_cancel_restart() -> str:
     return await _call("host_cancel_restart")
 
 
+# ---------------- File system (allowlisted) ----------------
+
+
+@mcp.tool()
+async def write_file(path: str, content: str, secret: bool = False, binary_b64: bool = False, encoding: str = "utf-8") -> str:
+    """Write a file on the agent host. Path must be absolute and live under
+    one of the allowed roots:
+      C:\\ProgramData\\ClaudeAgent\\secrets\\
+      C:\\ProgramData\\ClaudeAgent\\app-secrets\\<name>\\
+      <workspace_dir> (typically C:\\ClaudeAgent\\workspace\\)
+
+    Set secret=true to lock the file's ACL to SYSTEM:F + Administrators:F.
+    Set binary_b64=true to base64-decode `content` before writing.
+    Max 1 MB per call. Content is never logged."""
+    return await _call("write_file", {
+        "path": path, "content": content, "secret": secret,
+        "binary_b64": binary_b64, "encoding": encoding,
+    }, timeout=60)
+
+
+@mcp.tool()
+async def read_file(path: str, binary_b64: bool = False, encoding: str = "utf-8") -> str:
+    """Read a file from the agent host. Same allowlist as write_file.
+    Returns content as text, or base64-encoded bytes if binary_b64=true.
+    Max 1 MB per call."""
+    return await _call("read_file", {
+        "path": path, "binary_b64": binary_b64, "encoding": encoding,
+    }, timeout=30)
+
+
+@mcp.tool()
+async def delete_file(path: str) -> str:
+    """Delete a file on the agent host. Path must be in the allowlist.
+    Refuses to delete directories."""
+    return await _call("delete_file", {"path": path}, timeout=15)
+
+
+@mcp.tool()
+async def list_dir(path: str) -> str:
+    """List entries in a directory on the agent host (allowlisted paths only)."""
+    return await _call("list_dir", {"path": path}, timeout=15)
+
+
 @mcp.tool()
 async def run_deploy(deploy: str) -> str:
     """Run a registered deploy script. Streams stdout/stderr until exit."""
