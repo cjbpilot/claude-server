@@ -31,7 +31,9 @@ class Runner:
         self._stop_reason: str | None = None
         # Lazily imported to avoid pulling httpx into modules that don't need it.
         from agent.app_manager import AppManager
+        from agent.stats import StatsCollector
         self.app_manager = AppManager(cfg, self)
+        self.stats = StatsCollector(disk_path=str(cfg.workspace_dir.anchor or "C:\\"))
 
     def spawn(self, coro) -> None:
         """Fire-and-forget a background coroutine tied to the runner."""
@@ -142,6 +144,12 @@ class Runner:
 
             self.spawn(self._heartbeat_loop())
 
+            # Start the rolling-window utilisation sampler.
+            try:
+                await self.stats.start(self)
+            except Exception:
+                log.exception("stats collector failed to start")
+
             # Boot the app supervisor: load registry, launch desired-running apps.
             try:
                 await self.app_manager.start()
@@ -155,6 +163,10 @@ class Runner:
                 await self.app_manager.stop()
             except Exception:
                 log.exception("app supervisor stop failed")
+            try:
+                await self.stats.stop()
+            except Exception:
+                pass
             # Give in-flight publishes a moment to flush before closing.
             try:
                 await asyncio.wait_for(self.nc.flush(timeout=2), timeout=3)

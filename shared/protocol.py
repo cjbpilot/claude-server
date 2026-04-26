@@ -152,6 +152,7 @@ TOOLS = {
     "read_file",
     "delete_file",
     "list_dir",
+    "machine_stats",
     "tail_logs",
     "service_restart",
     "ollama_list",

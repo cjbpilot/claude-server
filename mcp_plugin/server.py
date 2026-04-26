@@ -261,6 +261,25 @@ async def list_dir(path: str) -> str:
     return await _call("list_dir", {"path": path}, timeout=15)
 
 
+# ---------------- Machine utilisation ----------------
+
+
+@mcp.tool()
+async def machine_stats(window_minutes: int = 5, top_processes: int = 10) -> str:
+    """Rich machine-utilisation snapshot.
+
+    Returns:
+      - current: live snapshot (CPU+per-core, RAM, swap, disk, network kbps)
+      - window: avg/min/max/p50/p95 over the past `window_minutes` (capped 60)
+      - top_processes: ranked by CPU and by RAM (set top_processes=0 to skip)
+
+    The agent samples every ~5s and keeps roughly the last hour in memory."""
+    return await _call("machine_stats", {
+        "window_minutes": window_minutes,
+        "top_processes": top_processes,
+    }, timeout=30)
+
+
 @mcp.tool()
 async def run_deploy(deploy: str) -> str:
     """Run a registered deploy script. Streams stdout/stderr until exit."""
