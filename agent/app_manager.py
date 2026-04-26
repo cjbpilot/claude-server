@@ -362,10 +362,28 @@ class AppManager:
             return
         proc = rt.proc
         if proc.returncode is None:
-            try:
-                proc.terminate()
-            except Exception:
-                pass
+            # Many app start commands shell out (mvnw.cmd, npm, dotnet, ...) and
+            # spawn child java/node processes. proc.terminate kills only the
+            # shell wrapper, leaving the actual app as an orphan that holds
+            # file locks (e.g., H2 .mv.db) and breaks the next launch. On
+            # Windows, taskkill /T walks the process tree and kills children.
+            tree_killed = False
+            if sys.platform == "win32":
+                try:
+                    tk = await asyncio.create_subprocess_exec(
+                        "taskkill", "/T", "/F", "/PID", str(proc.pid),
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.DEVNULL,
+                    )
+                    await asyncio.wait_for(tk.wait(), timeout=10)
+                    tree_killed = True
+                except Exception:
+                    log.exception("taskkill /T failed for %s pid=%s", name, proc.pid)
+            if not tree_killed:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
             try:
                 await asyncio.wait_for(proc.wait(), timeout=10)
             except asyncio.TimeoutError:
