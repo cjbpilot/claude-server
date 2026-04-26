@@ -26,17 +26,61 @@ async def handle_status(ctx, cmd: Command) -> Reply:
     cfg = ctx.cfg
     mem = psutil.virtual_memory()
     disk = psutil.disk_usage(str(cfg.workspace_dir.anchor or "C:\\"))
+
+    # Repos: merge dynamic registry with static config.
+    from agent import repo_store
+    dyn_repo_names = {r.name for r in repo_store.list_entries()}
+    static_repo_names = set(cfg.repos.keys())
+    repos_summary = {
+        "registered": sorted(dyn_repo_names | static_repo_names),
+        "dynamic": sorted(dyn_repo_names),
+        "static": sorted(static_repo_names - dyn_repo_names),
+    }
+
+    # Apps: ask the supervisor for live state.
+    apps_summary: list[dict] = []
+    try:
+        for a in ctx.runner.app_manager.list_apps():
+            apps_summary.append({
+                "name": a["name"],
+                "alive": a["alive"],
+                "desired": a["desired"],
+                "pid": a["pid"],
+                "uptime_s": a["uptime_s"],
+                "last_health": a["last_health"],
+                "last_exit_code": a["last_exit_code"],
+                "restarts_recent": a["restart_count_recent"],
+            })
+    except Exception:
+        pass
+
+    # Telegram bot status.
+    tg = {"running": False, "allowlisted": 0}
+    bot = getattr(ctx.runner, "telegram", None)
+    if bot is not None:
+        tg = {
+            "running": bot.application is not None,
+            "allowlisted": len(bot.allowlist),
+        }
+
     data = {
         "host": cfg.host_id,
         "version": __version__,
         "uptime_s": round(time.time() - _started, 1),
-        "cpu_pct": psutil.cpu_percent(interval=None),
-        "ram_pct": mem.percent,
-        "disk_pct": disk.percent,
+        "machine": {
+            "cpu_pct": psutil.cpu_percent(interval=None),
+            "ram_pct": mem.percent,
+            "ram_used_gb": round(mem.used / 1024**3, 1),
+            "ram_total_gb": round(mem.total / 1024**3, 1),
+            "disk_pct": disk.percent,
+            "disk_free_gb": round(disk.free / 1024**3, 1),
+        },
         "ollama_up": await _ollama_up(cfg.ollama_url),
-        "repos": list(cfg.repos.keys()),
+        "repos": repos_summary,
+        "apps": apps_summary,
         "deploys": list(cfg.deploys.keys()),
         "services": cfg.allowed_services,
+        "telegram": tg,
     }
     return Reply(id=cmd.id, ok=True, data=data)
 
