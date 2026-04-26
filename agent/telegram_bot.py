@@ -27,8 +27,11 @@ from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-from agent.handlers import REGISTRY, HandlerCtx
 from shared.protocol import Command
+
+# NOTE: REGISTRY and HandlerCtx are imported lazily inside _call() to avoid
+# a circular import (handlers/__init__.py imports telegram_admin which imports
+# this module).
 
 log = logging.getLogger("agent.telegram")
 
@@ -212,6 +215,7 @@ class TelegramBot:
             await update.effective_message.reply_text(chunk)
 
     async def _call(self, tool: str, args: Optional[dict] = None) -> str:
+        from agent.handlers import REGISTRY, HandlerCtx  # lazy: avoid import cycle
         handler = REGISTRY.get(tool)
         if handler is None:
             return f"❌ unknown tool: {tool}"
