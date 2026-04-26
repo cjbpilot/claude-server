@@ -228,16 +228,26 @@ class AppManager:
 
         Returns the list of app names that were cycled.
         """
+        def _looks_like_sha(s) -> bool:
+            return (
+                isinstance(s, str)
+                and 7 <= len(s) <= 64
+                and all(c in "0123456789abcdef" for c in s.lower())
+            )
+
         cycled = []
         for rt in list(self._apps.values()):
             if rt.record.repo_name != repo_name:
                 continue
-            if rt.record.last_known_sha == new_sha:
+            known = rt.record.last_known_sha
+            # Only skip if we have a real SHA on record AND it matches.
+            # Anything else (None, "HEAD", empty) means we don't trust the
+            # record - always cycle.
+            if _looks_like_sha(known) and known == new_sha:
                 continue
             app_store.set_last_sha(rt.record.name, new_sha)
             rt.record = app_store.get(rt.record.name) or rt.record
             if rt.manifest.restart.on_update and rt.record.desired_state == "running":
-                # Re-run install if defined.
                 if rt.manifest.install is not None:
                     await self._run_install(rt)
                 await self.restart_app(rt.record.name)
