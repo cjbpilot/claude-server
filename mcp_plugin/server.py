@@ -265,6 +265,33 @@ async def list_dir(path: str) -> str:
 
 
 @mcp.tool()
+async def telegram_allow(user_id: int) -> str:
+    """Add a Telegram user id to the bot's allowlist. Saves to
+    C:\\ProgramData\\ClaudeAgent\\secrets\\telegram_allow.txt and
+    updates the live bot's allowlist immediately."""
+    return await _call("telegram_allow", {"user_id": user_id})
+
+
+@mcp.tool()
+async def telegram_revoke(user_id: int) -> str:
+    """Remove a Telegram user id from the bot's allowlist."""
+    return await _call("telegram_revoke", {"user_id": user_id})
+
+
+@mcp.tool()
+async def telegram_reload() -> str:
+    """Re-read token + allowlist and restart the embedded Telegram bot.
+    Use after writing a new token via write_file."""
+    return await _call("telegram_reload", timeout=30)
+
+
+@mcp.tool()
+async def telegram_status() -> str:
+    """Report whether the Telegram bot is running and who's allowlisted."""
+    return await _call("telegram_status")
+
+
+@mcp.tool()
 async def machine_stats(window_minutes: int = 5, top_processes: int = 10) -> str:
     """Rich machine-utilisation snapshot.
 

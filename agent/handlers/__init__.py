@@ -8,7 +8,7 @@ from shared.protocol import Command, Reply
 
 from . import (
     app_admin, files, git_ops, host, machine, ollama, repo_admin, self_update,
-    services, status,
+    services, status, telegram_admin,
 )
 
 Handler = Callable[["HandlerCtx", Command], Awaitable[Reply]]
@@ -47,6 +47,10 @@ REGISTRY: dict[str, Handler] = {
     "delete_file": files.handle_delete_file,
     "list_dir": files.handle_list_dir,
     "machine_stats": machine.handle_machine_stats,
+    "telegram_allow": telegram_admin.handle_telegram_allow,
+    "telegram_revoke": telegram_admin.handle_telegram_revoke,
+    "telegram_reload": telegram_admin.handle_telegram_reload,
+    "telegram_status": telegram_admin.handle_telegram_status,
     "service_restart": services.handle_service_restart,
     "ollama_list": ollama.handle_list,
     "ollama_pull": ollama.handle_pull,

@@ -34,6 +34,13 @@ class Runner:
         from agent.stats import StatsCollector
         self.app_manager = AppManager(cfg, self)
         self.stats = StatsCollector(disk_path=str(cfg.workspace_dir.anchor or "C:\\"))
+        # Telegram bot: optional, only starts if a token file exists.
+        try:
+            from agent.telegram_bot import TelegramBot
+            self.telegram = TelegramBot(cfg, self)
+        except Exception:
+            log.exception("could not construct TelegramBot (telegram lib missing?)")
+            self.telegram = None
 
     def spawn(self, coro) -> None:
         """Fire-and-forget a background coroutine tied to the runner."""
@@ -156,9 +163,21 @@ class Runner:
             except Exception:
                 log.exception("app supervisor failed to start")
 
+            # Optional Telegram bot.
+            if self.telegram is not None:
+                try:
+                    await self.telegram.start()
+                except Exception:
+                    log.exception("telegram bot failed to start")
+
             await self._stop.wait()
             await self._publish_event("stopping", self._stop_reason or "stop requested")
         finally:
+            if self.telegram is not None:
+                try:
+                    await self.telegram.stop()
+                except Exception:
+                    log.exception("telegram bot stop failed")
             try:
                 await self.app_manager.stop()
             except Exception:
