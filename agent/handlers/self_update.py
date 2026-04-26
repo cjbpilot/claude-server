@@ -17,9 +17,12 @@ includes the report in its next heartbeat payload.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 from shared.protocol import Command, Reply, new_id
@@ -82,9 +85,18 @@ async def handle_self_update(hctx, cmd: Command) -> Reply:
     finally:
         log_fh.close()
 
-    # Ask the runner to stop. The Windows service manager will restart us
-    # because install-agent.ps1 sets SERVICE_AUTO_START with failure actions.
+    # Ask the runner to stop cleanly...
     hctx.runner.request_stop(reason="self_update")
+
+    # ...and arm a hard exit on a background thread as a safety net. If the
+    # asyncio event loop fails to unwind for any reason, this guarantees the
+    # updater isn't waiting on a PID that never dies. The reply has already
+    # been queued, so the caller's request/reply round-trip is fine.
+    def _hard_exit() -> None:
+        time.sleep(3)
+        os._exit(0)
+
+    threading.Thread(target=_hard_exit, daemon=True).start()
 
     return Reply(
         id=cmd.id,
