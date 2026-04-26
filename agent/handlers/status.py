@@ -42,11 +42,34 @@ async def handle_status(ctx, cmd: Command) -> Reply:
 
 
 async def handle_list_repos(ctx, cmd: Command) -> Reply:
-    data = [
-        {"name": r.name, "path": str(ctx.cfg.resolve_path(r.path)), "remote": r.remote, "branch": r.branch}
-        for r in ctx.cfg.repos.values()
-    ]
-    return Reply(id=cmd.id, ok=True, data=data)
+    from agent import repo_store
+
+    rows: dict[str, dict] = {}
+    # Dynamic registry first.
+    for e in repo_store.list_entries():
+        rows[e.name] = {
+            "name": e.name,
+            "url": e.url,
+            "branch": e.branch,
+            "has_token": bool(e.token),
+            "source": "dynamic",
+            "path": str(ctx.cfg.workspace_dir / e.name),
+            "added_at": e.added_at,
+            "updated_at": e.updated_at,
+        }
+    # Static entries fill in only if not overridden by dynamic.
+    for r in ctx.cfg.repos.values():
+        if r.name in rows:
+            continue
+        rows[r.name] = {
+            "name": r.name,
+            "url": r.remote,
+            "branch": r.branch,
+            "has_token": False,
+            "source": "static",
+            "path": str(ctx.cfg.resolve_path(r.path)),
+        }
+    return Reply(id=cmd.id, ok=True, data=list(rows.values()))
 
 
 async def handle_list_deploys(ctx, cmd: Command) -> Reply:

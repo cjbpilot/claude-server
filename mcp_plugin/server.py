@@ -119,6 +119,36 @@ async def git_pull(repo: str) -> str:
 
 
 @mcp.tool()
+async def register_repo(name: str, url: str, token: str | None = None, branch: str = "main") -> str:
+    """Register a repo the agent can git_pull. Provide an HTTPS clone url and a
+    GitHub PAT (ghp_/gho_/github_pat_/ghs_) for private repos. Pass token=null
+    or omit it for public repos. If 'name' is already registered, the entry is
+    replaced (use this also to change the URL or branch). The token is stored
+    on the agent host with SYSTEM-only ACL and never echoed in any reply or
+    log line."""
+    args: dict = {"name": name, "url": url, "branch": branch}
+    if token is not None:
+        args["token"] = token
+    return await _call("register_repo", args)
+
+
+@mcp.tool()
+async def update_repo_token(name: str, token: str | None = None) -> str:
+    """Rotate the auth token for a registered repo. Pass token=null to clear
+    it (e.g. if the repo became public)."""
+    args: dict = {"name": name}
+    if token is not None:
+        args["token"] = token
+    return await _call("update_repo_token", args)
+
+
+@mcp.tool()
+async def unregister_repo(name: str) -> str:
+    """Remove a repo from the dynamic registry. Does not delete the on-disk checkout."""
+    return await _call("unregister_repo", {"name": name})
+
+
+@mcp.tool()
 async def run_deploy(deploy: str) -> str:
     """Run a registered deploy script. Streams stdout/stderr until exit."""
     return await _call_and_follow("run_deploy", {"deploy": deploy})

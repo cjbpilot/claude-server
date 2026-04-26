@@ -139,14 +139,44 @@ After that, any time you push new agent code to `main`, invoke `self_update`
 from Claude Code and the Windows machine will pull, reinstall deps, and
 restart the service on its own.
 
-### B7. Authenticate git for private repos (optional)
+### B7. Registering private repos (preferred path)
 
-If any of your registered repos are private:
+The cleanest way to give the agent access to a private repo is to register
+it dynamically from Claude Code with a per-repo PAT — no static config
+needed. The agent stores the URL, branch, and token in
+`C:\ProgramData\ClaudeAgent\repos.json` (ACL: SYSTEM:F + Administrators:F).
+The token is injected into `git` via a per-process env var so it never
+appears in argv, never lands in `.git/config`, and never reaches any log
+or NATS reply.
 
-- Install **GitHub CLI** (`gh`) and run `gh auth setup-git` as the user the
-  service runs under (LocalSystem by default — see below), **or**
-- Change the service account to your user (`services.msc` → ClaudeAgent →
-  Log On tab) and configure `git` credentials for that user, **or**
+In Claude Code:
+
+    > use the claude-agent MCP, register_repo with:
+    >   name = my-app
+    >   url = https://github.com/you/my-app.git
+    >   token = ghp_xxxxxxxxxxxxxxxx
+    >   branch = main
+
+To rotate or clear the token:
+
+    > update_repo_token my-app ghp_yyyyyyyyyyyyyyyy
+    > update_repo_token my-app null    # clears (e.g. repo became public)
+
+To remove a repo from the registry (does NOT delete the on-disk checkout):
+
+    > unregister_repo my-app
+
+Generate a fine-grained PAT at <https://github.com/settings/tokens?type=beta>
+with **Contents: Read** on the specific repo(s). Set an expiry. Treat the
+token like a password.
+
+Public repos don't need a token — register with `token = null` (or omit it).
+
+### B7-alt. Static config (legacy)
+
+You can still pre-declare repos in `agent.toml` (see B5). Static entries
+work for public repos but have no place to store a token. If a repo with
+the same name exists in both places, the dynamic registry wins.
 - Use a deploy key / HTTPS token baked into the remote URL in `agent.toml`.
 
 ---

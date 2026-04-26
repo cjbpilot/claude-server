@@ -35,19 +35,44 @@ class JobContext:
         await self.nc.publish(subjects.job_done(self.host, self.job_id), msg.to_json())
 
 
-async def run_subprocess(ctx: JobContext, cmd: str, cwd: str, timeout_s: int = 600) -> int:
+async def run_subprocess(
+    ctx: JobContext,
+    cmd: str,
+    cwd: str,
+    timeout_s: int = 600,
+    env: dict | None = None,
+    redact: list[str] | None = None,
+) -> int:
     """Run a shell command, stream its output, return exit code.
 
     Uses the Windows shell so PowerShell one-liners and chained commands work
     out of the box.
+
+    `env` is passed verbatim to the child process. The caller can stash secrets
+    here (the values are never logged) and reference them by name from the
+    command string.
+
+    `redact` is a list of literal strings to scrub from the logged command and
+    every line of streamed output before it leaves this process. Use it for
+    any secret that does end up in argv.
     """
-    await ctx.info(f"$ {cmd}  (cwd={cwd})")
+
+    def _scrub(s: str) -> str:
+        if not redact:
+            return s
+        for needle in redact:
+            if needle:
+                s = s.replace(needle, "<redacted>")
+        return s
+
+    await ctx.info(f"$ {_scrub(cmd)}  (cwd={cwd})")
 
     proc = await asyncio.create_subprocess_shell(
         cmd,
         cwd=cwd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env=env,
     )
 
     async def pump(stream, name):
@@ -60,7 +85,7 @@ async def run_subprocess(ctx: JobContext, cmd: str, cwd: str, timeout_s: int = 6
                 text = raw.decode("utf-8", errors="replace").rstrip()
             except Exception:
                 text = repr(raw)
-            await ctx.log(text, stream=name)
+            await ctx.log(_scrub(text), stream=name)
 
     try:
         await asyncio.wait_for(
