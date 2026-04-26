@@ -115,15 +115,13 @@ async def handle_git_pull(hctx, cmd: Command) -> Reply:
             auth_url = _authed_url(repo.url, repo.token)
             # Update the remote URL inline (with token) for this fetch only,
             # then restore the clean URL so .git/config never persists it.
-            # `checkout -B` creates-or-resets the local branch from
-            # origin/<branch>, which is also what we want when recovering
-            # from a partial clone that lacks a local branch.
+            # Reset to FETCH_HEAD so we don't depend on remote-tracking refs
+            # being present (they may not be after a partial/broken clone).
             cmd_str = (
                 f'git remote set-url origin "{auth_url}" && '
                 f"git fetch origin {repo.branch} && "
                 f'git remote set-url origin "{repo.url}" && '
-                f"git checkout -B {repo.branch} origin/{repo.branch} && "
-                f"git reset --hard origin/{repo.branch}"
+                f"git reset --hard FETCH_HEAD"
             )
             redact = [repo.token, auth_url] if repo.token else []
             rc = await run_subprocess(
