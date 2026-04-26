@@ -20,9 +20,6 @@ from agent.jobs import JobContext, run_subprocess
 from shared.protocol import Command, Reply, new_id
 
 
-_AUTH_ENV_VAR = "AGENT_GIT_AUTH"
-
-
 @dataclass
 class _ResolvedRepo:
     name: str
@@ -58,37 +55,32 @@ def _resolve(hctx, name: str) -> _ResolvedRepo | None:
     )
 
 
-def _origin_base(url: str) -> str | None:
-    """Return scheme://host/ for use in git's http.<base>.extraheader key."""
-    p = urlparse(url)
-    if not p.scheme or not p.netloc:
-        return None
-    return f"{p.scheme}://{p.netloc}/"
+def _authed_url(url: str, token: Optional[str]) -> str:
+    """Embed the token in an HTTPS clone URL for one-shot auth.
 
-
-def _git_cmd(args: str, *, url: str, token: Optional[str]) -> tuple[str, dict | None, list[str]]:
-    """Build (command_str, env, redact_list) for a git invocation.
-
-    If token is provided, injects --config-env=http.<base>.extraheader=AGENT_GIT_AUTH
-    immediately after the leading 'git'. The token is only ever in the env
-    var value, never in argv. `redact` is included as a defensive backstop.
+    GitHub accepts https://<token>@github.com/... and
+    https://x-access-token:<token>@github.com/... for any PAT family.
+    The token ends up in argv for the spawned git, so the caller MUST
+    pass it through run_subprocess(..., redact=[token]) to keep it out
+    of logs.
     """
     if not token:
-        return args, None, []
-    base = _origin_base(url)
-    if not base:
-        return args, None, []
+        return url
+    p = urlparse(url)
+    if not p.scheme.startswith("http"):
+        return url
+    netloc = f"x-access-token:{token}@{p.hostname}"
+    if p.port:
+        netloc += f":{p.port}"
+    return p._replace(netloc=netloc).geturl()
 
-    parts = args.split(" ", 1)
-    if not parts or parts[0] != "git":
-        return args, None, [token]
-    rest = parts[1] if len(parts) > 1 else ""
-    cfg_arg = f'--config-env=http.{base}.extraheader={_AUTH_ENV_VAR}'
-    cmd = f'git {cfg_arg} {rest}'.strip()
 
+def _git_env() -> dict:
+    """Env that prevents git from hanging on a credential prompt."""
     env = os.environ.copy()
-    env[_AUTH_ENV_VAR] = f"Authorization: token {token}"
-    return cmd, env, [token]
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GIT_ASKPASS"] = "echo"
+    return env
 
 
 async def _ensure_repo(ctx: JobContext, repo: _ResolvedRepo) -> int:
@@ -96,11 +88,12 @@ async def _ensure_repo(ctx: JobContext, repo: _ResolvedRepo) -> int:
         return 0
     await ctx.info(f"cloning {repo.url} into {repo.path}")
     repo.path.parent.mkdir(parents=True, exist_ok=True)
-    raw = f'git clone --branch {repo.branch} "{repo.url}" "{repo.path}"'
-    cmd, env, redact = _git_cmd(raw, url=repo.url, token=repo.token)
+    auth_url = _authed_url(repo.url, repo.token)
+    cmd = f'git clone --branch {repo.branch} "{auth_url}" "{repo.path}"'
+    redact = [repo.token, auth_url] if repo.token else []
     return await run_subprocess(
         ctx, cmd, cwd=str(repo.path.parent),
-        timeout_s=300, env=env, redact=redact,
+        timeout_s=300, env=_git_env(), redact=redact,
     )
 
 
@@ -119,15 +112,20 @@ async def handle_git_pull(hctx, cmd: Command) -> Reply:
             if rc != 0:
                 await jctx.done(ok=False, exit_code=rc, error="clone failed")
                 return
-            raw = (
+            auth_url = _authed_url(repo.url, repo.token)
+            # Update the remote URL inline (with token) for this fetch only,
+            # then restore the clean URL so .git/config never persists it.
+            cmd_str = (
+                f'git remote set-url origin "{auth_url}" && '
                 f"git fetch origin {repo.branch} && "
+                f'git remote set-url origin "{repo.url}" && '
                 f"git checkout {repo.branch} && "
                 f"git reset --hard origin/{repo.branch}"
             )
-            cmd_str, env, redact = _git_cmd(raw, url=repo.url, token=repo.token)
+            redact = [repo.token, auth_url] if repo.token else []
             rc = await run_subprocess(
                 jctx, cmd_str, cwd=str(repo.path),
-                timeout_s=300, env=env, redact=redact,
+                timeout_s=300, env=_git_env(), redact=redact,
             )
             await jctx.done(ok=(rc == 0), exit_code=rc)
         except Exception as e:
