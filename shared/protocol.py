@@ -146,6 +146,8 @@ TOOLS = {
     "restart_app",
     "list_apps",
     "app_logs",
+    "host_restart",
+    "host_cancel_restart",
     "tail_logs",
     "service_restart",
     "ollama_list",

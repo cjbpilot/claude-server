@@ -179,6 +179,28 @@ def _setup_logging() -> None:
     root.addHandler(handler)
 
 
+def _prevent_sleep() -> None:
+    """Tell Windows to stay awake while the agent is running.
+
+    Sets ES_CONTINUOUS | ES_SYSTEM_REQUIRED so the system does not enter
+    sleep, but allows the display to power off normally. The flag persists
+    for the calling thread (the agent's main thread) and clears
+    automatically when the process exits, so we don't need a teardown.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        ES_CONTINUOUS = 0x80000000
+        ES_SYSTEM_REQUIRED = 0x00000001
+        ctypes.windll.kernel32.SetThreadExecutionState(
+            ES_CONTINUOUS | ES_SYSTEM_REQUIRED
+        )
+        log.info("sleep prevention engaged (ES_CONTINUOUS | ES_SYSTEM_REQUIRED)")
+    except Exception:
+        log.exception("could not set thread execution state; machine may sleep")
+
+
 def _prefer_ipv4_on_windows() -> None:
     """Filter DNS results to prefer IPv4 on Windows."""
     if sys.platform != "win32":
@@ -256,6 +278,7 @@ def main() -> int:
     import signal
 
     _setup_logging()
+    _prevent_sleep()
     _prefer_ipv4_on_windows()
     _install_sync_connect_shim()
     cfg = config.load()

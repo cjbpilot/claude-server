@@ -200,6 +200,24 @@ async def app_logs(name: str, lines: int = 100) -> str:
     return await _call("app_logs", {"name": name, "lines": lines})
 
 
+# ---------------- Host power ----------------
+
+
+@mcp.tool()
+async def host_restart(delay_s: int = 30, force: bool = True, reason: str = "claude-agent host_restart") -> str:
+    """Schedule a Windows reboot of the host machine. Default 30-second delay
+    so you can call host_cancel_restart to abort. After reboot, the agent
+    auto-starts via Scheduled Task and re-launches every app whose
+    desired_state was 'running'."""
+    return await _call("host_restart", {"delay_s": delay_s, "force": force, "reason": reason})
+
+
+@mcp.tool()
+async def host_cancel_restart() -> str:
+    """Abort a pending host_restart while it's still in the delay window."""
+    return await _call("host_cancel_restart")
+
+
 @mcp.tool()
 async def run_deploy(deploy: str) -> str:
     """Run a registered deploy script. Streams stdout/stderr until exit."""
