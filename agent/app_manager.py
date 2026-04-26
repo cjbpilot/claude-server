@@ -150,10 +150,23 @@ class AppManager:
                     "install": install_result, "started": False,
                 }
 
+        ollama_result = "skipped"
+        if manifest.ollama is not None:
+            ok, ollama_result = await self._ensure_ollama(rt)
+            if not ok:
+                app_store.set_desired(manifest.name, "stopped")
+                rt.record = app_store.get(manifest.name) or rec
+                return {
+                    "name": manifest.name, "repo": repo_name,
+                    "install": install_result, "ollama": ollama_result,
+                    "started": False,
+                }
+
         await self._launch(manifest.name)
         return {
             "name": manifest.name, "repo": repo_name,
-            "install": install_result, "started": True,
+            "install": install_result, "ollama": ollama_result,
+            "started": True,
         }
 
     async def unregister(self, name: str) -> bool:
@@ -295,6 +308,10 @@ class AppManager:
 
         env = os.environ.copy()
         env.update(manifest.env)
+        if manifest.ollama is not None:
+            env[manifest.ollama.env_var] = manifest.ollama.host
+            if manifest.ollama.default_model:
+                env[manifest.ollama.model_env_var] = manifest.ollama.default_model
 
         self._rotate_log_if_needed(name)
         log_fh = open(self._log_path(name), "ab", buffering=0)
@@ -395,6 +412,66 @@ class AppManager:
             with log_path.open("ab") as f:
                 f.write(f"--- install error: {e!r} ---\n".encode("utf-8"))
             return 1
+
+    async def _ensure_ollama(self, rt: _Runtime) -> tuple[bool, str]:
+        """Verify Ollama is reachable, pull missing models, optionally warm them.
+
+        Returns (ok, summary_string). Progress is appended to the per-app log.
+        """
+        spec = rt.manifest.ollama
+        if spec is None:
+            return True, "skipped"
+
+        log_path = self._log_path(rt.record.name)
+
+        def _log(line: str) -> None:
+            try:
+                with log_path.open("ab") as f:
+                    f.write((line + "\n").encode("utf-8"))
+            except Exception:
+                pass
+
+        _log(f"--- ollama: probing {spec.host} ---")
+        try:
+            r = await self._http.get(f"{spec.host}/api/tags", timeout=10)
+            r.raise_for_status()
+            tags = r.json().get("models") or []
+            installed_full = {m.get("name", "") for m in tags}
+        except Exception as e:
+            _log(f"ollama unreachable at {spec.host}: {e!r}")
+            return False, f"unreachable: {e!r}"
+
+        missing = [m for m in spec.models if m not in installed_full]
+        for model in missing:
+            _log(f"--- ollama pull {model} ---")
+            try:
+                async with self._http.stream(
+                    "POST", f"{spec.host}/api/pull",
+                    json={"name": model, "stream": True},
+                    timeout=None,
+                ) as resp:
+                    resp.raise_for_status()
+                    async for line in resp.aiter_lines():
+                        if line:
+                            _log(f"  {line}")
+            except Exception as e:
+                _log(f"ollama pull {model} failed: {e!r}")
+                return False, f"pull {model} failed: {e!r}"
+
+        if spec.warm:
+            for model in spec.models:
+                try:
+                    await self._http.post(
+                        f"{spec.host}/api/generate",
+                        json={"model": model, "prompt": "", "keep_alive": spec.keep_alive},
+                        timeout=120,
+                    )
+                    _log(f"warmed {model} (keep_alive={spec.keep_alive})")
+                except Exception as e:
+                    _log(f"warm {model} failed (non-fatal): {e!r}")
+
+        models_summary = ", ".join(spec.models) if spec.models else "(none)"
+        return True, f"ready: {models_summary}"
 
     async def _supervisor_loop(self) -> None:
         log.info("app supervisor loop started")

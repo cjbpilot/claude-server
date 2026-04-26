@@ -79,6 +79,20 @@ class RestartSpec:
 
 
 @dataclass
+class OllamaSpec:
+    """Optional Ollama integration. If present, the agent ensures the listed
+    models are pulled before the app starts, and injects host/model env vars
+    into the app's process so it can talk to local Ollama without config."""
+    host: str = "http://127.0.0.1:11434"
+    env_var: str = "OLLAMA_HOST"
+    model_env_var: str = "OLLAMA_MODEL"
+    models: list = field(default_factory=list)
+    default_model: Optional[str] = None
+    warm: bool = False
+    keep_alive: str = "24h"
+
+
+@dataclass
 class AppManifest:
     name: str
     start: StartSpec
@@ -86,6 +100,7 @@ class AppManifest:
     env: dict = field(default_factory=dict)
     health: Optional[HealthSpec] = None
     restart: RestartSpec = field(default_factory=RestartSpec)
+    ollama: Optional[OllamaSpec] = None
 
     def to_dict(self) -> dict:
         d: dict = {
@@ -107,6 +122,16 @@ class AppManifest:
                 "interval_s": self.health.interval_s,
                 "timeout_s": self.health.timeout_s,
                 "expect_status": self.health.expect_status,
+            }
+        if self.ollama is not None:
+            d["ollama"] = {
+                "host": self.ollama.host,
+                "env_var": self.ollama.env_var,
+                "model_env_var": self.ollama.model_env_var,
+                "models": list(self.ollama.models),
+                "default_model": self.ollama.default_model,
+                "warm": self.ollama.warm,
+                "keep_alive": self.ollama.keep_alive,
             }
         return d
 
@@ -212,7 +237,20 @@ def _from_dict(data: dict, default_name: str) -> AppManifest:
         max_per_hour=int(restart_raw.get("max_per_hour", 10)),
     )
 
+    ollama: Optional[OllamaSpec] = None
+    ollama_raw = data.get("ollama") or {}
+    if ollama_raw:
+        ollama = OllamaSpec(
+            host=str(ollama_raw.get("host", "http://127.0.0.1:11434")),
+            env_var=str(ollama_raw.get("env_var", "OLLAMA_HOST")),
+            model_env_var=str(ollama_raw.get("model_env_var", "OLLAMA_MODEL")),
+            models=[str(m) for m in (ollama_raw.get("models") or [])],
+            default_model=(str(ollama_raw["default_model"]) if ollama_raw.get("default_model") else None),
+            warm=bool(ollama_raw.get("warm", False)),
+            keep_alive=str(ollama_raw.get("keep_alive", "24h")),
+        )
+
     return AppManifest(
         name=name, start=start, install=install,
-        env=env, health=health, restart=restart,
+        env=env, health=health, restart=restart, ollama=ollama,
     )
