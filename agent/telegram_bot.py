@@ -131,33 +131,79 @@ class TelegramBot:
         self.runner = runner
         self.application: Optional[Application] = None
         self.allowlist: set = set()
-        self._task: Optional[asyncio.Task] = None
+        self._stop_evt = asyncio.Event()
+        self._watchdog_started = False
+
+    def is_running(self) -> bool:
+        app = self.application
+        if app is None:
+            return False
+        u = getattr(app, "updater", None)
+        return u is not None and getattr(u, "running", False)
 
     async def start(self) -> None:
+        """Initial start: try once, kick off the watchdog regardless. The
+        watchdog will keep retrying if this initial attempt fails so a flaky
+        boot (transient Telegram API timeout) doesn't leave the bot dead."""
+        if not load_token():
+            log.info("no Telegram token at %s - bot disabled", TOKEN_PATH)
+            return
+        await self._try_start()
+        if not self._watchdog_started:
+            self._watchdog_started = True
+            self.runner.spawn(self._watchdog_loop())
+
+    async def _try_start(self) -> bool:
         token = load_token()
         if not token:
-            log.info("no Telegram token at %s — bot disabled", TOKEN_PATH)
-            return
+            return False
         self.allowlist = load_allowlist()
-
-        self.application = Application.builder().token(token).build()
-        self._register_handlers()
         try:
-            await self.application.initialize()
-            await self.application.start()
-            await self.application.updater.start_polling(drop_pending_updates=True)
+            app = Application.builder().token(token).build()
+            self.application = app
+            self._register_handlers()
+            await app.initialize()
+            await app.start()
+            await app.updater.start_polling(drop_pending_updates=True)
             log.info("Telegram bot started; %d allowlisted user(s)", len(self.allowlist))
+            return True
         except Exception:
-            log.exception("Telegram bot failed to start")
+            log.exception("Telegram bot start failed (watchdog will retry)")
+            try:
+                if self.application is not None:
+                    await self.application.shutdown()
+            except Exception:
+                pass
             self.application = None
+            return False
+
+    async def _watchdog_loop(self) -> None:
+        """Periodically verify the bot is polling. If it's not (failed initial
+        start, transient network error killed the updater, etc), try again."""
+        while not self._stop_evt.is_set():
+            try:
+                await asyncio.wait_for(self._stop_evt.wait(), timeout=30)
+                break  # stop requested
+            except asyncio.TimeoutError:
+                pass
+            if not load_token():
+                continue  # token removed, do nothing
+            if not self.is_running():
+                log.warning("Telegram bot not running, attempting restart")
+                try:
+                    await self.stop()
+                except Exception:
+                    pass
+                await self._try_start()
 
     async def stop(self) -> None:
         app = self.application
         if app is None:
             return
         try:
-            if app.updater and app.updater.running:
-                await app.updater.stop()
+            u = getattr(app, "updater", None)
+            if u is not None and getattr(u, "running", False):
+                await u.stop()
             await app.stop()
             await app.shutdown()
         except Exception:
@@ -168,8 +214,11 @@ class TelegramBot:
     async def reload(self) -> str:
         """Re-read token + allowlist and (re)start the bot."""
         await self.stop()
-        await self.start()
-        return "ok" if self.application else "no token"
+        await self._try_start()
+        if not self._watchdog_started:
+            self._watchdog_started = True
+            self.runner.spawn(self._watchdog_loop())
+        return "ok" if self.is_running() else ("no token" if not load_token() else "start_failed")
 
     # ---------------- handler plumbing ----------------
 
