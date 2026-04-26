@@ -277,6 +277,12 @@ class TelegramBot:
             return f"❌ {reply.error or 'failed'}"
         if reply.data is None:
             return "OK"
+        formatter = _FORMATTERS.get(tool)
+        if formatter is not None:
+            try:
+                return formatter(reply.data)
+            except Exception:
+                log.exception("formatter for %s failed; falling back to JSON", tool)
         return "OK\n" + json.dumps(reply.data, indent=2, default=str)
 
     # ---------------- commands ----------------
@@ -366,3 +372,218 @@ def _chunked(text: str, n: int):
     while pos < len(text):
         yield text[pos:pos + n]
         pos += n
+
+
+# ---------------- Pretty formatters for /command output ----------------
+
+
+def _fmt_duration(secs) -> str:
+    try:
+        s = int(secs)
+    except (TypeError, ValueError):
+        return "?"
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m {s % 60}s"
+    if s < 86400:
+        return f"{s // 3600}h {(s % 3600) // 60}m"
+    return f"{s // 86400}d {(s % 86400) // 3600}h"
+
+
+def _fmt_status(d: dict) -> str:
+    L = []
+    L.append(f"Agent v{d.get('version', '?')} on {d.get('host', '?')}")
+    L.append(f"Uptime: {_fmt_duration(d.get('uptime_s', 0))}")
+    m = d.get("machine") or {}
+    L.append(
+        f"CPU {m.get('cpu_pct', 0):.1f}%  "
+        f"RAM {m.get('ram_pct', 0):.1f}% "
+        f"({m.get('ram_used_gb', 0)}/{m.get('ram_total_gb', 0)} GB)  "
+        f"Disk {m.get('disk_pct', 0):.1f}% ({m.get('disk_free_gb', 0)} GB free)"
+    )
+    L.append(f"Ollama: {'up' if d.get('ollama_up') else 'DOWN'}")
+    tg = d.get("telegram") or {}
+    L.append(f"Telegram: {'running' if tg.get('running') else 'down'}, {tg.get('allowlisted', 0)} user(s)")
+
+    apps = d.get("apps") or []
+    if apps:
+        L.append("")
+        L.append("Apps:")
+        for a in apps:
+            state = "alive" if a.get("alive") else f"DOWN (rc={a.get('last_exit_code')})"
+            extras = []
+            if a.get("last_health"):
+                extras.append(f"health={a['last_health']}")
+            if a.get("uptime_s") is not None:
+                extras.append(f"up {_fmt_duration(a['uptime_s'])}")
+            if a.get("restarts_recent"):
+                extras.append(f"restarts={a['restarts_recent']}")
+            extra_str = " | ".join(extras)
+            line = f"  {a.get('name')}: {state} (desired={a.get('desired')})"
+            if extra_str:
+                line += f"  [{extra_str}]"
+            L.append(line)
+
+    repos = d.get("repos") or {}
+    if repos.get("dynamic"):
+        L.append(f"\nRepos (dynamic): {', '.join(repos['dynamic'])}")
+    if repos.get("static"):
+        L.append(f"Repos (static):  {', '.join(repos['static'])}")
+    deploys = d.get("deploys") or []
+    if deploys:
+        L.append(f"Deploys: {', '.join(deploys)}")
+    services = d.get("services") or []
+    if services:
+        L.append(f"Services: {', '.join(services)}")
+    return "\n".join(L)
+
+
+def _fmt_apps(rows: list) -> str:
+    if not rows:
+        return "no apps registered"
+    L = ["Managed apps:"]
+    for a in rows:
+        state = "alive" if a.get("alive") else f"DOWN (rc={a.get('last_exit_code')})"
+        line = f"  {a.get('name')}: {state} (desired={a.get('desired')})"
+        bits = []
+        if a.get("pid"):
+            bits.append(f"pid={a['pid']}")
+        if a.get("uptime_s") is not None:
+            bits.append(f"up {_fmt_duration(a['uptime_s'])}")
+        if a.get("last_health"):
+            bits.append(f"health={a['last_health']}")
+        if a.get("restart_count_recent") or a.get("restarts_recent"):
+            bits.append(f"restarts={a.get('restart_count_recent', a.get('restarts_recent'))}")
+        if bits:
+            line += f"  [{' | '.join(bits)}]"
+        L.append(line)
+    return "\n".join(L)
+
+
+def _fmt_repos(rows: list) -> str:
+    if not rows:
+        return "no repos registered"
+    L = ["Registered repos:"]
+    for r in rows:
+        flags = []
+        if r.get("has_token"):
+            flags.append("auth")
+        if r.get("source"):
+            flags.append(r["source"])
+        suffix = f"  [{', '.join(flags)}]" if flags else ""
+        L.append(f"  {r.get('name')}: {r.get('url')}  ({r.get('branch', 'main')}){suffix}")
+    return "\n".join(L)
+
+
+def _fmt_services(rows) -> str:
+    if not rows:
+        return "no services allowlisted"
+    if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+        # If it ever changes shape, fall back gracefully.
+        return "Services:\n" + "\n".join(f"  {r}" for r in rows)
+    return "Services: " + ", ".join(rows)
+
+
+def _fmt_deploys(rows: list) -> str:
+    if not rows:
+        return "no deploys configured"
+    L = ["Deploys:"]
+    for d in rows:
+        L.append(f"  {d.get('name')}: {d.get('cmd')} (cwd={d.get('cwd')}, timeout={d.get('timeout_s')}s)")
+    return "\n".join(L)
+
+
+def _fmt_machine(d: dict) -> str:
+    L = []
+    cur = d.get("current") or {}
+    if cur:
+        L.append(
+            f"Now: CPU {cur.get('cpu_pct', 0):.1f}%  "
+            f"RAM {cur.get('ram_pct', 0):.1f}% ({cur.get('ram_used_gb', 0)}/{cur.get('ram_total_gb', 0)} GB)  "
+            f"Disk {cur.get('disk_pct', 0):.1f}% ({cur.get('disk_free_gb', 0)} GB free)  "
+            f"Net ↑{cur.get('net_sent_kbps', 0):.1f} ↓{cur.get('net_recv_kbps', 0):.1f} kbps"
+        )
+    w = d.get("window") or {}
+    if w and w.get("samples"):
+        mins = w.get("window_s", 0) // 60
+        cpu = w.get("cpu_pct") or {}
+        ram = w.get("ram_pct") or {}
+        L.append(
+            f"Last {mins}m ({w.get('samples')} samples):  "
+            f"CPU avg {cpu.get('avg', 0):.1f}% / p95 {cpu.get('p95', 0):.1f}% / max {cpu.get('max', 0):.1f}%  "
+            f"RAM avg {ram.get('avg', 0):.1f}% / max {ram.get('max', 0):.1f}%"
+        )
+    tp = d.get("top_processes") or {}
+    by_cpu = tp.get("by_cpu") or []
+    by_ram = tp.get("by_ram") or []
+    if by_cpu:
+        L.append("\nTop CPU:")
+        for p in by_cpu[:6]:
+            name = p.get("name") or "?"
+            L.append(f"  {p.get('cpu_pct', 0):>5.1f}%  {name} (pid {p.get('pid')})")
+    if by_ram:
+        L.append("\nTop RAM:")
+        for p in by_ram[:6]:
+            name = p.get("name") or "?"
+            L.append(f"  {p.get('ram_mb', 0):>6.0f} MB  {name} (pid {p.get('pid')})")
+    return "\n".join(L) or "no samples yet"
+
+
+def _fmt_ollama_list(d) -> str:
+    models = (d or {}).get("models") if isinstance(d, dict) else None
+    if not models:
+        return "no models installed"
+    L = ["Installed Ollama models:"]
+    for m in models:
+        size_gb = (m.get("size") or 0) / 1024**3
+        L.append(f"  {m.get('name')}  ({size_gb:.1f} GB)")
+    return "\n".join(L)
+
+
+def _fmt_ollama_ps(d) -> str:
+    models = (d or {}).get("models") if isinstance(d, dict) else None
+    if not models:
+        return "no models loaded"
+    L = ["Loaded Ollama models:"]
+    for m in models:
+        size_gb = (m.get("size") or 0) / 1024**3
+        L.append(f"  {m.get('name')}  ({size_gb:.1f} GB resident)")
+    return "\n".join(L)
+
+
+def _fmt_app_logs(d: dict) -> str:
+    name = d.get("name", "?")
+    rows = d.get("lines") or []
+    if not rows:
+        return f"app {name}: log empty"
+    return f"--- {name} (last {len(rows)} lines) ---\n" + "\n".join(rows)
+
+
+def _fmt_simple_named(d: dict) -> str:
+    """For tools that return {'name': ...} or {'name': ..., 'extra': ...}."""
+    if not isinstance(d, dict):
+        return str(d)
+    name = d.get("name") or d.get("repo") or d.get("deploy") or d.get("service") or "?"
+    extras = {k: v for k, v in d.items() if k not in {"name"}}
+    if not extras:
+        return f"OK: {name}"
+    return f"OK: {name}\n" + json.dumps(extras, indent=2, default=str)
+
+
+_FORMATTERS = {
+    "status": _fmt_status,
+    "list_apps": _fmt_apps,
+    "list_repos": _fmt_repos,
+    "list_services": _fmt_services,
+    "list_deploys": _fmt_deploys,
+    "machine_stats": _fmt_machine,
+    "ollama_list": _fmt_ollama_list,
+    "ollama_ps": _fmt_ollama_ps,
+    "app_logs": _fmt_app_logs,
+    "start_app": _fmt_simple_named,
+    "stop_app": _fmt_simple_named,
+    "restart_app": _fmt_simple_named,
+    "git_pull": _fmt_simple_named,
+    "service_restart": _fmt_simple_named,
+}
