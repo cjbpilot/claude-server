@@ -46,6 +46,7 @@ REGISTRY: dict[str, Handler] = {
     "read_file": files.handle_read_file,
     "delete_file": files.handle_delete_file,
     "list_dir": files.handle_list_dir,
+    "tail_logs": files.handle_tail_logs,
     "machine_stats": machine.handle_machine_stats,
     "telegram_allow": telegram_admin.handle_telegram_allow,
     "telegram_revoke": telegram_admin.handle_telegram_revoke,

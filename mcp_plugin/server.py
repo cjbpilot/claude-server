@@ -261,6 +261,16 @@ async def list_dir(path: str) -> str:
     return await _call("list_dir", {"path": path}, timeout=15)
 
 
+@mcp.tool()
+async def tail_logs(file: str = "agent", lines: int = 100) -> str:
+    """Tail one of the agent's own log files over the wire.
+
+    `file` is one of: 'agent' (default), 'stderr', 'stdout', 'updater',
+    or an app shorthand like 'stronghold' (resolves to app-stronghold.log).
+    Always reads from C:\\ProgramData\\ClaudeAgent\\logs\\."""
+    return await _call("tail_logs", {"file": file, "lines": lines}, timeout=20)
+
+
 # ---------------- Machine utilisation ----------------
 
 

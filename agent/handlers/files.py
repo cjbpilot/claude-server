@@ -224,6 +224,65 @@ async def handle_delete_file(hctx, cmd: Command) -> Reply:
     return Reply(id=cmd.id, ok=True, data={"path": str(target), "removed": True})
 
 
+_LOG_DIR = Path(r"C:\ProgramData\ClaudeAgent\logs")
+_LOG_FILES = {
+    "agent": _LOG_DIR / "agent.log",
+    "stderr": _LOG_DIR / "stderr.log",
+    "stdout": _LOG_DIR / "stdout.log",
+    "updater": _LOG_DIR / "updater.log",
+}
+
+
+async def handle_tail_logs(hctx, cmd: Command) -> Reply:
+    """Tail one of the agent's own log files. Args:
+
+      file: 'agent' (default) | 'stderr' | 'stdout' | 'updater'
+            OR an absolute path under C:\\ProgramData\\ClaudeAgent\\logs\\
+            OR an app log name -> we look up app-<name>.log
+      lines: number of trailing lines (default 100, max 2000)
+    """
+    name = (cmd.args.get("file") or "agent").strip()
+    lines = int(cmd.args.get("lines") or 100)
+    lines = max(1, min(2000, lines))
+
+    target: Path | None = None
+    if name in _LOG_FILES:
+        target = _LOG_FILES[name]
+    else:
+        candidate = Path(name)
+        if candidate.is_absolute():
+            try:
+                resolved = candidate.resolve()
+                resolved.relative_to(_LOG_DIR.resolve())
+                target = resolved
+            except Exception:
+                return Reply(id=cmd.id, ok=False,
+                             error=f"path must be inside {_LOG_DIR}")
+        else:
+            # Treat as an app log shorthand.
+            target = _LOG_DIR / f"app-{name}.log"
+
+    if not target.exists():
+        return Reply(id=cmd.id, ok=False, error=f"not found: {target}")
+
+    try:
+        with target.open("rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            read = min(size, max(lines * 200, 16384))
+            f.seek(size - read)
+            blob = f.read().decode("utf-8", errors="replace")
+    except Exception as e:
+        return Reply(id=cmd.id, ok=False, error=repr(e))
+
+    rows = blob.splitlines()[-lines:]
+    return Reply(id=cmd.id, ok=True, data={
+        "path": str(target),
+        "lines": rows,
+        "total_size": size,
+    })
+
+
 async def handle_list_dir(hctx, cmd: Command) -> Reply:
     path_arg = (cmd.args.get("path") or "").strip()
     if not path_arg:

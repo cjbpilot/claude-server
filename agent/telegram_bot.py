@@ -88,41 +88,40 @@ def remove_allowed(user_id: int) -> set:
     return ids
 
 
-HELP_TEXT = """\
-🤖 *Claude-Agent Telegram Bot*
+HELP_TEXT = """Claude-Agent Telegram Bot
 
-Bootstrap: */myid* to see your Telegram id, then ask Claude to call
-`telegram_allow user_id=<id>` to authorise you.
+Bootstrap: send /myid to see your Telegram id, then ask Claude to call
+telegram_allow user_id=<id> to authorise you.
 
-*Read-only*
-/status — agent + machine snapshot
-/machine — utilisation (5m window) + top processes
-/apps — list managed apps
-/app_logs `<name>` `[lines]` — tail per-app log
-/repos — list registered repos
-/services — list allowlisted Windows services
-/ollama — installed Ollama models
-/ollama_ps — currently loaded models
-/myid — show your Telegram user id
-/help — this message
+Read-only:
+  /status         agent + machine snapshot
+  /machine        utilisation (5m window) + top processes
+  /apps           list managed apps
+  /app_logs <name> [lines]   tail per-app log
+  /repos          list registered repos
+  /services       list allowlisted Windows services
+  /ollama         installed Ollama models
+  /ollama_ps      currently loaded models
+  /myid           show your Telegram user id
+  /help           this message
 
-*App control*
-/app_start `<name>`
-/app_stop `<name>`
-/app_restart `<name>`
+App control:
+  /app_start <name>
+  /app_stop <name>
+  /app_restart <name>
 
-*Repo control*
-/pull `<repo>` — git_pull
+Repo control:
+  /pull <repo>    git_pull
 
-*Service control*
-/service_restart `<name>`
+Service control:
+  /service_restart <name>
 
-*Host control*
-/host_restart — schedules reboot in 30s; use /host_cancel to abort
-/host_cancel
-/self_update — pull agent code and restart
+Host control:
+  /host_restart [delay_s]    schedules reboot; use /host_cancel to abort
+  /host_cancel
+  /self_update               pull agent code and restart
 
-Power users — anything not covered: ask Claude.
+Anything else: ask Claude over MCP.
 """
 
 
@@ -228,13 +227,13 @@ class TelegramBot:
         if not reply.ok:
             return f"❌ {reply.error or 'failed'}"
         if reply.data is None:
-            return "✅ ok"
-        return "✅\n```\n" + json.dumps(reply.data, indent=2, default=str) + "\n```"
+            return "OK"
+        return "OK\n" + json.dumps(reply.data, indent=2, default=str)
 
     # ---------------- commands ----------------
 
     async def cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        await update.effective_message.reply_text(HELP_TEXT, parse_mode=ParseMode.MARKDOWN)
+        await update.effective_message.reply_text(HELP_TEXT)
 
     async def cmd_myid(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         u = update.effective_user
@@ -242,9 +241,9 @@ class TelegramBot:
             await update.effective_message.reply_text("no user info")
             return
         await update.effective_message.reply_text(
-            f"Your Telegram id: `{u.id}`\nName: {u.full_name}\n"
-            f"Allowlisted: {'yes' if u.id in self.allowlist else 'no'}",
-            parse_mode=ParseMode.MARKDOWN,
+            f"Your Telegram id: {u.id}\n"
+            f"Name: {u.full_name}\n"
+            f"Allowlisted: {'yes' if u.id in self.allowlist else 'no'}"
         )
 
     async def _gated(self, update: Update, tool: str, args: Optional[dict] = None) -> None:
