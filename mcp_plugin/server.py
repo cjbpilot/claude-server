@@ -262,6 +262,26 @@ async def list_dir(path: str) -> str:
 
 
 @mcp.tool()
+async def run_command(command: str, shell: str = "powershell", cwd: str | None = None, timeout_s: int = 60) -> str:
+    """Run an arbitrary command on the agent host. Runs as the agent's user
+    account (SYSTEM by default) so it can do anything Windows admin tools
+    can. Use for diagnostics, self-healing, package installs, registry
+    tweaks, hardware queries, etc.
+
+    `shell` is one of: 'powershell' (default, uses powershell.exe -Command),
+    'pwsh' (PowerShell 7+), 'cmd' (cmd.exe /c).
+    `cwd` if given must be absolute. Defaults to the workspace dir.
+    `timeout_s` default 60, max 600. Output capped at 256 KB per stream.
+
+    Returns stdout, stderr, exit_code. There's no streaming — for long
+    output use run_deploy on a wrapped script."""
+    args: dict = {"command": command, "shell": shell, "timeout_s": timeout_s}
+    if cwd:
+        args["cwd"] = cwd
+    return await _call("run_command", args, timeout=timeout_s + 10)
+
+
+@mcp.tool()
 async def tail_logs(file: str = "agent", lines: int = 100) -> str:
     """Tail one of the agent's own log files over the wire.
 

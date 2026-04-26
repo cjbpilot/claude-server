@@ -157,6 +157,7 @@ TOOLS = {
     "telegram_revoke",
     "telegram_reload",
     "telegram_status",
+    "run_command",
     "tail_logs",
     "service_restart",
     "ollama_list",
