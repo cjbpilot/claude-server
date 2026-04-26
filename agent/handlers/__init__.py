@@ -6,7 +6,7 @@ from typing import Any, Awaitable, Callable
 
 from shared.protocol import Command, Reply
 
-from . import git_ops, ollama, repo_admin, self_update, services, status
+from . import app_admin, git_ops, ollama, repo_admin, self_update, services, status
 
 Handler = Callable[["HandlerCtx", Command], Awaitable[Reply]]
 
@@ -30,6 +30,13 @@ REGISTRY: dict[str, Handler] = {
     "register_repo": repo_admin.handle_register_repo,
     "unregister_repo": repo_admin.handle_unregister_repo,
     "update_repo_token": repo_admin.handle_update_repo_token,
+    "register_app": app_admin.handle_register_app,
+    "unregister_app": app_admin.handle_unregister_app,
+    "start_app": app_admin.handle_start_app,
+    "stop_app": app_admin.handle_stop_app,
+    "restart_app": app_admin.handle_restart_app,
+    "list_apps": app_admin.handle_list_apps,
+    "app_logs": app_admin.handle_app_logs,
     "service_restart": services.handle_service_restart,
     "ollama_list": ollama.handle_list,
     "ollama_pull": ollama.handle_pull,

@@ -148,6 +148,58 @@ async def unregister_repo(name: str) -> str:
     return await _call("unregister_repo", {"name": name})
 
 
+# ---------------- Managed apps ----------------
+
+
+@mcp.tool()
+async def register_app(repo: str, name: str | None = None) -> str:
+    """Register a managed app from a previously-registered repo. The agent reads
+    the claude-agent manifest from the repo's README.md (a fenced ```claude-agent
+    block) or from a .claude-agent.toml file at the repo root, runs the install
+    command if defined, and starts the app under supervision. Provide `name`
+    only if you want to override the default (which is the repo name)."""
+    args: dict = {"repo": repo}
+    if name:
+        args["name"] = name
+    return await _call("register_app", args, timeout=120)
+
+
+@mcp.tool()
+async def unregister_app(name: str) -> str:
+    """Stop and unregister a managed app. Process is killed; on-disk repo is left in place."""
+    return await _call("unregister_app", {"name": name}, timeout=30)
+
+
+@mcp.tool()
+async def start_app(name: str) -> str:
+    """Start a registered app (if currently stopped)."""
+    return await _call("start_app", {"name": name})
+
+
+@mcp.tool()
+async def stop_app(name: str) -> str:
+    """Stop a registered app. Supervisor will not auto-restart while desired_state is 'stopped'."""
+    return await _call("stop_app", {"name": name})
+
+
+@mcp.tool()
+async def restart_app(name: str) -> str:
+    """Cycle a registered app: stop then start."""
+    return await _call("restart_app", {"name": name})
+
+
+@mcp.tool()
+async def list_apps() -> str:
+    """List managed apps with their live status (alive/desired/pid/uptime/health)."""
+    return await _call("list_apps")
+
+
+@mcp.tool()
+async def app_logs(name: str, lines: int = 100) -> str:
+    """Tail the per-app log file (stdout+stderr captured by the supervisor)."""
+    return await _call("app_logs", {"name": name, "lines": lines})
+
+
 @mcp.tool()
 async def run_deploy(deploy: str) -> str:
     """Run a registered deploy script. Streams stdout/stderr until exit."""

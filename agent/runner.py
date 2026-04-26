@@ -29,6 +29,9 @@ class Runner:
         self._tasks: set[asyncio.Task] = set()
         self._started_at = time.time()
         self._stop_reason: str | None = None
+        # Lazily imported to avoid pulling httpx into modules that don't need it.
+        from agent.app_manager import AppManager
+        self.app_manager = AppManager(cfg, self)
 
     def spawn(self, coro) -> None:
         """Fire-and-forget a background coroutine tied to the runner."""
@@ -139,9 +142,19 @@ class Runner:
 
             self.spawn(self._heartbeat_loop())
 
+            # Boot the app supervisor: load registry, launch desired-running apps.
+            try:
+                await self.app_manager.start()
+            except Exception:
+                log.exception("app supervisor failed to start")
+
             await self._stop.wait()
             await self._publish_event("stopping", self._stop_reason or "stop requested")
         finally:
+            try:
+                await self.app_manager.stop()
+            except Exception:
+                log.exception("app supervisor stop failed")
             # Give in-flight publishes a moment to flush before closing.
             try:
                 await asyncio.wait_for(self.nc.flush(timeout=2), timeout=3)

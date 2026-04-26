@@ -128,12 +128,40 @@ async def handle_git_pull(hctx, cmd: Command) -> Reply:
                 jctx, cmd_str, cwd=str(repo.path),
                 timeout_s=300, env=_git_env(), redact=redact,
             )
+            if rc == 0:
+                await _notify_apps_on_pull(hctx, jctx, repo)
             await jctx.done(ok=(rc == 0), exit_code=rc)
         except Exception as e:
             await jctx.done(ok=False, error=repr(e))
 
     hctx.runner.spawn(run())
     return Reply(id=cmd.id, ok=True, job_id=job_id, data={"repo": name})
+
+
+async def _notify_apps_on_pull(hctx, jctx: JobContext, repo: _ResolvedRepo) -> None:
+    """After a successful pull, tell the app manager so it can restart any
+    apps tied to this repo whose manifest opts in via restart.on_update."""
+    import asyncio as _aio
+    try:
+        proc = await _aio.create_subprocess_shell(
+            "git rev-parse HEAD",
+            cwd=str(repo.path),
+            stdout=_aio.subprocess.PIPE,
+            stderr=_aio.subprocess.DEVNULL,
+        )
+        out, _ = await proc.communicate()
+        sha = (out or b"").decode("utf-8", errors="replace").strip()
+    except Exception:
+        sha = ""
+    if not sha:
+        return
+    try:
+        cycled = await hctx.runner.app_manager.notify_pull(repo.name, sha)
+    except Exception as e:
+        await jctx.info(f"app manager notify_pull failed: {e!r}")
+        return
+    if cycled:
+        await jctx.info(f"cycled apps after update: {', '.join(cycled)}")
 
 
 async def handle_run_deploy(hctx, cmd: Command) -> Reply:
