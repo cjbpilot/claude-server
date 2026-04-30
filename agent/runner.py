@@ -119,6 +119,74 @@ class Runner:
         except Exception:
             log.exception("event publish failed")
 
+    async def _connect_nats(self):
+        """(Re)build the NATS client and subscribe to the command wildcard."""
+        nc = await nats.connect(
+            servers=[self.cfg.nats_url],
+            user_credentials=str(self.cfg.nats_creds),
+            name=f"claude-agent/{self.cfg.host_id}",
+            max_reconnect_attempts=-1,
+            reconnect_time_wait=2,
+        )
+        await nc.subscribe(
+            subjects.cmd_wildcard(self.cfg.host_id),
+            cb=self._handle_message,
+        )
+        return nc
+
+    async def _nats_watchdog(self) -> None:
+        """Periodically verify the NATS link is alive; rebuild it if not.
+
+        nats-py's built-in reconnect doesn't always recover from every
+        failure mode (websocket-layer hangs, server-initiated drops mid-
+        long-stream). When we detect the connection is closed or a flush
+        round-trip fails, we tear it down and reconnect from scratch -
+        which also re-subscribes to the command wildcard. The Telegram
+        bot keeps polling regardless because it's independent of NATS.
+        """
+        while not self._stop.is_set():
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=30)
+                break
+            except asyncio.TimeoutError:
+                pass
+
+            nc = self.nc
+            if nc is None:
+                continue
+
+            healthy = False
+            try:
+                if getattr(nc, "is_connected", False) and not getattr(nc, "is_closed", True):
+                    await asyncio.wait_for(nc.flush(timeout=2), timeout=4)
+                    healthy = True
+            except Exception:
+                healthy = False
+
+            if healthy:
+                continue
+
+            log.warning(
+                "NATS unhealthy (connected=%s closed=%s); rebuilding",
+                getattr(nc, "is_connected", "?"),
+                getattr(nc, "is_closed", "?"),
+            )
+            try:
+                await asyncio.wait_for(nc.close(), timeout=5)
+            except Exception:
+                pass
+
+            try:
+                self.nc = await self._connect_nats()
+                log.info("NATS reconnected after watchdog")
+                # Re-announce so MCP clients see we're back.
+                try:
+                    await self._publish_event("started", f"agent {__version__} reconnected")
+                except Exception:
+                    pass
+            except Exception:
+                log.exception("NATS reconnect attempt failed; will retry next tick")
+
     async def _announce_update_report(self) -> None:
         """If the updater left a report, publish it once then delete it."""
         try:
@@ -131,25 +199,14 @@ class Runner:
 
     async def run(self) -> None:
         log.info("connecting to %s as host=%s version=%s", self.cfg.nats_url, self.cfg.host_id, __version__)
-        self.nc = await nats.connect(
-            servers=[self.cfg.nats_url],
-            user_credentials=str(self.cfg.nats_creds),
-            name=f"claude-agent/{self.cfg.host_id}",
-            max_reconnect_attempts=-1,
-            reconnect_time_wait=2,
-        )
+        self.nc = await self._connect_nats()
         try:
             log.info("NATS connected - agent %s online as host=%s", __version__, self.cfg.host_id)
             await self._publish_event("started", f"agent {__version__} online")
             await self._announce_update_report()
 
-            # One wildcard subscription covers every tool.
-            await self.nc.subscribe(
-                subjects.cmd_wildcard(self.cfg.host_id),
-                cb=self._handle_message,
-            )
-
             self.spawn(self._heartbeat_loop())
+            self.spawn(self._nats_watchdog())
 
             # Start the rolling-window utilisation sampler.
             try:
