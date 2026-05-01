@@ -262,7 +262,15 @@ class TelegramBot:
         for chunk in _chunked(text, TG_MAX):
             await update.effective_message.reply_text(chunk)
 
-    async def _call(self, tool: str, args: Optional[dict] = None) -> str:
+    async def _call(self, tool: str, args: Optional[dict] = None,
+                    update: Optional[Update] = None) -> str:
+        """Run a command and return the immediate Telegram response.
+
+        If the handler kicks off a background job (returns reply.job_id),
+        we additionally spawn a watcher that posts a follow-up message
+        to the same chat when the job completes - so the user finds out
+        when 'pull stronghold' actually finishes installing and cycling.
+        """
         from agent.handlers import REGISTRY, HandlerCtx  # lazy: avoid import cycle
         handler = REGISTRY.get(tool)
         if handler is None:
@@ -275,6 +283,21 @@ class TelegramBot:
             return f"❌ handler raised: {e!r}"
         if not reply.ok:
             return f"❌ {reply.error or 'failed'}"
+
+        # Job-based: ack immediately, post follow-up when done
+        if reply.job_id and update is not None:
+            chat = update.effective_chat
+            msg = update.effective_message
+            if chat is not None:
+                self.runner.spawn(self._follow_job(
+                    chat_id=chat.id,
+                    reply_to=msg.message_id if msg else None,
+                    tool=tool,
+                    job_id=reply.job_id,
+                    initial_data=reply.data or {},
+                ))
+            return _fmt_job_started(tool, reply)
+
         if reply.data is None:
             return "OK"
         formatter = _FORMATTERS.get(tool)
@@ -284,6 +307,68 @@ class TelegramBot:
             except Exception:
                 log.exception("formatter for %s failed; falling back to JSON", tool)
         return "OK\n" + json.dumps(reply.data, indent=2, default=str)
+
+    async def _follow_job(self, chat_id: int, reply_to: Optional[int],
+                          tool: str, job_id: str, initial_data: dict) -> None:
+        """Subscribe to job_done for `job_id` and post a follow-up message."""
+        from shared import protocol as _proto, subjects as _subj
+        nc = self.runner.nc
+        if nc is None:
+            return
+        loop = asyncio.get_event_loop()
+        fut: asyncio.Future = loop.create_future()
+
+        async def on_done(msg):
+            if fut.done():
+                return
+            try:
+                fut.set_result(_proto.JobDone.from_json(msg.data))
+            except Exception as e:
+                fut.set_exception(e)
+
+        try:
+            sub = await nc.subscribe(
+                _subj.job_done(self.cfg.host_id, job_id),
+                cb=on_done,
+            )
+        except Exception:
+            log.exception("could not subscribe to job_done for %s", job_id)
+            return
+
+        try:
+            try:
+                done = await asyncio.wait_for(fut, timeout=1800)  # 30 min cap
+            except asyncio.TimeoutError:
+                await self._send_chat(
+                    chat_id,
+                    f"⏱️ {tool} job {job_id[:8]} still running after 30 min — check /apps or /app_logs",
+                    reply_to=reply_to,
+                )
+                return
+            await self._send_chat(
+                chat_id,
+                _fmt_job_done(tool, done, initial_data),
+                reply_to=reply_to,
+            )
+        finally:
+            try:
+                await sub.unsubscribe()
+            except Exception:
+                pass
+
+    async def _send_chat(self, chat_id: int, text: str, reply_to: Optional[int] = None) -> None:
+        if not self.is_running() or self.application is None:
+            return
+        try:
+            for chunk in _chunked(text, TG_MAX):
+                await self.application.bot.send_message(
+                    chat_id=chat_id,
+                    text=chunk,
+                    reply_to_message_id=reply_to,
+                )
+                reply_to = None  # only attach the reply_to to the first chunk
+        except Exception:
+            log.exception("send_chat failed")
 
     # ---------------- commands ----------------
 
@@ -305,7 +390,7 @@ class TelegramBot:
         if not self._authorized(update):
             await self._reject(update)
             return
-        result = await self._call(tool, args)
+        result = await self._call(tool, args, update=update)
         await self._send(update, result)
 
     async def cmd_status(self, u, c):           await self._gated(u, "status")
@@ -339,7 +424,7 @@ class TelegramBot:
                 lines = max(1, min(200, int(args[1])))
             except ValueError:
                 pass
-        result = await self._call("app_logs", {"name": name, "lines": lines})
+        result = await self._call("app_logs", {"name": name, "lines": lines}, update=u)
         await self._send(u, result)
 
     async def cmd_host_restart(self, u, c):
@@ -352,7 +437,7 @@ class TelegramBot:
                 delay = max(0, int(c.args[0]))
             except ValueError:
                 pass
-        await self._send(u, await self._call("host_restart", {"delay_s": delay}))
+        await self._send(u, await self._call("host_restart", {"delay_s": delay}, update=u))
 
     async def _with_arg(self, u, c, tool, arg_name):
         if not self._authorized(u):
@@ -361,7 +446,7 @@ class TelegramBot:
         if not c.args:
             await u.effective_message.reply_text(f"usage: /{tool} <{arg_name}>")
             return
-        await self._send(u, await self._call(tool, {arg_name: c.args[0]}))
+        await self._send(u, await self._call(tool, {arg_name: c.args[0]}, update=u))
 
 
 def _chunked(text: str, n: int):
@@ -561,14 +646,67 @@ def _fmt_app_logs(d: dict) -> str:
 
 
 def _fmt_simple_named(d: dict) -> str:
-    """For tools that return {'name': ...} or {'name': ..., 'extra': ...}."""
+    """For tools that return {'name': ...} or close variants."""
     if not isinstance(d, dict):
         return str(d)
-    name = d.get("name") or d.get("repo") or d.get("deploy") or d.get("service") or "?"
-    extras = {k: v for k, v in d.items() if k not in {"name"}}
+    name = (d.get("name") or d.get("repo") or d.get("deploy")
+            or d.get("service") or d.get("model") or "?")
+    extras = {k: v for k, v in d.items()
+              if k not in {"name", "repo", "deploy", "service", "model"}}
     if not extras:
         return f"OK: {name}"
-    return f"OK: {name}\n" + json.dumps(extras, indent=2, default=str)
+    extra_lines = "\n".join(f"  {k}: {v}" for k, v in extras.items())
+    return f"OK: {name}\n{extra_lines}"
+
+
+def _fmt_self_update(d: dict) -> str:
+    return ("🔄 self_update queued — agent will exit in ~3s and the task "
+            "scheduler will relaunch it. Run /status in 30–60s to see the "
+            "new version.")
+
+
+def _fmt_host_restart(d: dict) -> str:
+    delay = d.get("restart_in_s", 30)
+    reason = d.get("reason", "")
+    extra = f" — {reason}" if reason else ""
+    return (f"⚠️ Host reboot scheduled in {delay}s{extra}. "
+            f"Use /host_cancel within the window to abort.")
+
+
+def _fmt_host_cancel(d: dict) -> str:
+    if d.get("cancelled"):
+        return "✅ Host reboot cancelled."
+    return "ℹ️ " + (d.get("note") or "no shutdown was pending")
+
+
+def _fmt_telegram_status(d: dict) -> str:
+    running = d.get("running")
+    allow = d.get("allowlist") or []
+    state = "running" if running else "down"
+    return f"Telegram bot: {state}\nAllowlisted users: {len(allow)} ({', '.join(str(a) for a in allow) or '—'})"
+
+
+def _fmt_job_started(tool: str, reply) -> str:
+    """Initial ack for tools that return a job_id; the watcher will follow up."""
+    data = reply.data or {}
+    name = (data.get("repo") or data.get("deploy") or data.get("service")
+            or data.get("model") or "")
+    suffix = f" {name}" if name else ""
+    short = (reply.job_id or "")[:8]
+    return f"⏳ {tool}{suffix} started (job {short}) — I'll let you know when it's done."
+
+
+def _fmt_job_done(tool: str, done, initial_data: dict) -> str:
+    icon = "✅" if done.ok else "❌"
+    name = (initial_data.get("repo") or initial_data.get("deploy")
+            or initial_data.get("service") or initial_data.get("model") or "")
+    suffix = f" {name}" if name else ""
+    secs = (done.duration_ms or 0) / 1000
+    rc = "" if done.exit_code is None else f", rc={done.exit_code}"
+    line = f"{icon} {tool}{suffix} finished — {secs:.1f}s{rc}"
+    if done.error:
+        line += f"\n  error: {done.error}"
+    return line
 
 
 _FORMATTERS = {
@@ -580,10 +718,23 @@ _FORMATTERS = {
     "machine_stats": _fmt_machine,
     "ollama_list": _fmt_ollama_list,
     "ollama_ps": _fmt_ollama_ps,
+    "ollama_stop": _fmt_simple_named,
     "app_logs": _fmt_app_logs,
     "start_app": _fmt_simple_named,
     "stop_app": _fmt_simple_named,
     "restart_app": _fmt_simple_named,
-    "git_pull": _fmt_simple_named,
-    "service_restart": _fmt_simple_named,
+    "register_app": _fmt_simple_named,
+    "unregister_app": _fmt_simple_named,
+    "register_repo": _fmt_simple_named,
+    "unregister_repo": _fmt_simple_named,
+    "update_repo_token": _fmt_simple_named,
+    "git_pull": _fmt_simple_named,            # used only when no job_id
+    "service_restart": _fmt_simple_named,     # ditto
+    "self_update": _fmt_self_update,
+    "host_restart": _fmt_host_restart,
+    "host_cancel_restart": _fmt_host_cancel,
+    "telegram_status": _fmt_telegram_status,
+    "telegram_allow": _fmt_telegram_status,
+    "telegram_revoke": _fmt_telegram_status,
+    "telegram_reload": _fmt_telegram_status,
 }
