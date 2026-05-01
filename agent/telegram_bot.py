@@ -23,9 +23,9 @@ import logging
 from pathlib import Path
 from typing import Optional
 
-from telegram import Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes
 
 from shared.protocol import Command
 
@@ -88,7 +88,36 @@ def remove_allowed(user_id: int) -> set:
     return ids
 
 
+# Registered with Telegram via setMyCommands so typing "/" in a chat with the
+# bot pops up an autocomplete list with descriptions.
+BOT_COMMANDS: list[tuple[str, str]] = [
+    ("menu", "Open the interactive menu"),
+    ("status", "Agent + machine snapshot"),
+    ("machine", "Utilisation + top processes"),
+    ("apps", "List managed apps"),
+    ("app_logs", "Tail an app's log: /app_logs <name> [lines]"),
+    ("app_start", "Start an app: /app_start <name>"),
+    ("app_stop", "Stop an app: /app_stop <name>"),
+    ("app_restart", "Restart an app: /app_restart <name>"),
+    ("repos", "List registered repos"),
+    ("pull", "git_pull a repo: /pull <repo>"),
+    ("services", "List allowlisted Windows services"),
+    ("service_restart", "Restart a Windows service: /service_restart <name>"),
+    ("ollama", "Installed Ollama models"),
+    ("ollama_ps", "Currently loaded Ollama models"),
+    ("host_restart", "Reboot the host: /host_restart [delay_s]"),
+    ("host_cancel", "Abort a pending reboot"),
+    ("self_update", "Pull agent code and restart"),
+    ("watchdog", "External watchdog kill history"),
+    ("myid", "Show your Telegram user id"),
+    ("help", "Help text"),
+]
+
+
 HELP_TEXT = """Claude-Agent Telegram Bot
+
+Tip: type / in the chat to see autocomplete with descriptions, or run
+/menu for an interactive button-driven UI.
 
 Bootstrap: send /myid to see your Telegram id, then ask Claude to call
 telegram_allow user_id=<id> to authorise you.
@@ -166,6 +195,12 @@ class TelegramBot:
             await app.initialize()
             await app.start()
             await app.updater.start_polling(drop_pending_updates=True)
+            try:
+                await app.bot.set_my_commands(
+                    [BotCommand(name, desc) for name, desc in BOT_COMMANDS]
+                )
+            except Exception:
+                log.exception("set_my_commands failed (commands will still work)")
             log.info("Telegram bot started; %d allowlisted user(s)", len(self.allowlist))
             return True
         except Exception:
@@ -247,9 +282,11 @@ class TelegramBot:
             ("host_cancel", self.cmd_host_cancel),
             ("self_update", self.cmd_self_update),
             ("watchdog", self.cmd_watchdog),
+            ("menu", self.cmd_menu),
         ]
         for name, fn in cmds:
             app.add_handler(CommandHandler(name, fn))
+        app.add_handler(CallbackQueryHandler(self.on_callback))
 
     def _authorized(self, update: Update) -> bool:
         uid = update.effective_user.id if update.effective_user else None
@@ -406,6 +443,191 @@ class TelegramBot:
     async def cmd_host_cancel(self, u, c):      await self._gated(u, "host_cancel_restart")
     async def cmd_watchdog(self, u, c):         await self._gated(u, "watchdog_stats")
 
+    async def cmd_menu(self, u, c):
+        if not self._authorized(u):
+            await self._reject(u)
+            return
+        await u.effective_message.reply_text(
+            "Pick a category:",
+            reply_markup=_menu_main_keyboard(),
+        )
+
+    async def on_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        cq = update.callback_query
+        if cq is None:
+            return
+        if not self._authorized(update):
+            await cq.answer("Not authorised")
+            return
+        await cq.answer()
+        data = cq.data or ""
+
+        if data.startswith("run:"):
+            tool = data[4:]
+            args = {}
+            if tool == "machine":
+                tool = "machine_stats"
+                args = {"window_minutes": 5, "top_processes": 8}
+            result = await self._call(tool, args)
+            await self._send(update, result)
+            return
+
+        if data.startswith("repo_pull:"):
+            repo = data[len("repo_pull:"):]
+            await self._send(update, f"Pulling {repo}...")
+            result = await self._call("git_pull", {"repo": repo})
+            await self._send(update, result)
+            return
+
+        if data.startswith("app_action:"):
+            payload = data[len("app_action:"):]
+            action, _, name = payload.partition(":")
+            tool_map = {"start": "start_app", "stop": "stop_app",
+                        "restart": "restart_app", "logs": "app_logs"}
+            tool = tool_map.get(action)
+            if not tool:
+                await self._send(update, f"unknown action: {action}")
+                return
+            args = {"name": name}
+            if action == "logs":
+                args["lines"] = 50
+            result = await self._call(tool, args)
+            await self._send(update, result)
+            return
+
+        if data.startswith("svc_restart:"):
+            svc = data[len("svc_restart:"):]
+            result = await self._call("service_restart", {"name": svc})
+            await self._send(update, result)
+            return
+
+        if data.startswith("ollama_stop:"):
+            model = data[len("ollama_stop:"):]
+            result = await self._call("ollama_stop", {"model": model})
+            await self._send(update, result)
+            return
+
+        if data == "menu:main":
+            try:
+                await cq.edit_message_text("Pick a category:", reply_markup=_menu_main_keyboard())
+            except Exception:
+                await cq.message.reply_text("Pick a category:", reply_markup=_menu_main_keyboard())
+            return
+
+        if data == "menu:apps":
+            await self._send_apps_menu(cq)
+            return
+
+        if data == "menu:repos":
+            await self._send_repos_menu(cq)
+            return
+
+        if data == "menu:ollama":
+            await self._send_ollama_menu(cq)
+            return
+
+        if data == "menu:host":
+            await self._send_host_menu(cq)
+            return
+
+        if data == "menu:services":
+            await self._send_services_menu(cq)
+            return
+
+        await self._send(update, f"unknown menu action: {data}")
+
+    async def _send_apps_menu(self, cq) -> None:
+        reply = await self._call_raw("list_apps")
+        rows = []
+        if reply.ok and isinstance(reply.data, list):
+            rows = [
+                [InlineKeyboardButton(f"📜 {a['name']} logs", callback_data=f"app_action:logs:{a['name']}")]
+                for a in reply.data
+            ]
+            for a in (reply.data or []):
+                name = a["name"]
+                rows.append([
+                    InlineKeyboardButton(f"▶ start {name}", callback_data=f"app_action:start:{name}"),
+                    InlineKeyboardButton(f"■ stop {name}", callback_data=f"app_action:stop:{name}"),
+                    InlineKeyboardButton(f"↻ restart {name}", callback_data=f"app_action:restart:{name}"),
+                ])
+        rows.append([InlineKeyboardButton("📋 list_apps", callback_data="run:list_apps")])
+        rows.append(_menu_back_row())
+        try:
+            await cq.edit_message_text("Apps:", reply_markup=InlineKeyboardMarkup(rows))
+        except Exception:
+            await cq.message.reply_text("Apps:", reply_markup=InlineKeyboardMarkup(rows))
+
+    async def _send_repos_menu(self, cq) -> None:
+        reply = await self._call_raw("list_repos")
+        rows = [[InlineKeyboardButton("📋 list_repos", callback_data="run:list_repos")]]
+        if reply.ok and isinstance(reply.data, list):
+            for r in reply.data:
+                name = r.get("name") or "?"
+                rows.append([InlineKeyboardButton(f"⬇ pull {name}", callback_data=f"repo_pull:{name}")])
+        rows.append(_menu_back_row())
+        try:
+            await cq.edit_message_text("Repos:", reply_markup=InlineKeyboardMarkup(rows))
+        except Exception:
+            await cq.message.reply_text("Repos:", reply_markup=InlineKeyboardMarkup(rows))
+
+    async def _send_ollama_menu(self, cq) -> None:
+        rows = [
+            [InlineKeyboardButton("📦 ollama_list", callback_data="run:ollama_list")],
+            [InlineKeyboardButton("📊 ollama_ps", callback_data="run:ollama_ps")],
+        ]
+        # populate stop buttons for currently loaded models
+        ps_reply = await self._call_raw("ollama_ps")
+        if ps_reply.ok and isinstance(ps_reply.data, dict):
+            for m in (ps_reply.data.get("models") or []):
+                name = m.get("name")
+                if name:
+                    rows.append([InlineKeyboardButton(f"⏏ unload {name}", callback_data=f"ollama_stop:{name}")])
+        rows.append(_menu_back_row())
+        try:
+            await cq.edit_message_text("Ollama:", reply_markup=InlineKeyboardMarkup(rows))
+        except Exception:
+            await cq.message.reply_text("Ollama:", reply_markup=InlineKeyboardMarkup(rows))
+
+    async def _send_host_menu(self, cq) -> None:
+        rows = [
+            [InlineKeyboardButton("⚡ host_restart (30s)", callback_data="run:host_restart")],
+            [InlineKeyboardButton("🛑 host_cancel", callback_data="run:host_cancel_restart")],
+            [InlineKeyboardButton("⬆ self_update agent", callback_data="run:self_update")],
+            _menu_back_row(),
+        ]
+        try:
+            await cq.edit_message_text("Host:", reply_markup=InlineKeyboardMarkup(rows))
+        except Exception:
+            await cq.message.reply_text("Host:", reply_markup=InlineKeyboardMarkup(rows))
+
+    async def _send_services_menu(self, cq) -> None:
+        reply = await self._call_raw("list_services")
+        rows = []
+        if reply.ok and isinstance(reply.data, list):
+            for svc in reply.data:
+                rows.append([InlineKeyboardButton(f"↻ restart {svc}", callback_data=f"svc_restart:{svc}")])
+        if not rows:
+            rows.append([InlineKeyboardButton("(no services allowlisted)", callback_data="menu:main")])
+        rows.append(_menu_back_row())
+        try:
+            await cq.edit_message_text("Services:", reply_markup=InlineKeyboardMarkup(rows))
+        except Exception:
+            await cq.message.reply_text("Services:", reply_markup=InlineKeyboardMarkup(rows))
+
+    async def _call_raw(self, tool: str, args: Optional[dict] = None):
+        from agent.handlers import REGISTRY, HandlerCtx  # lazy
+        from shared.protocol import Reply
+        handler = REGISTRY.get(tool)
+        if handler is None:
+            return Reply(id="?", ok=False, error=f"unknown tool: {tool}")
+        cmd = Command(tool=tool, args=args or {})
+        hctx = HandlerCtx(self.cfg, self.runner.nc, self.runner)
+        try:
+            return await handler(hctx, cmd)
+        except Exception as e:
+            return Reply(id="?", ok=False, error=repr(e))
+
     async def cmd_app_start(self, u, c):        await self._with_arg(u, c, "start_app", "name")
     async def cmd_app_stop(self, u, c):         await self._with_arg(u, c, "stop_app", "name")
     async def cmd_app_restart(self, u, c):      await self._with_arg(u, c, "restart_app", "name")
@@ -450,6 +672,31 @@ class TelegramBot:
             await u.effective_message.reply_text(f"usage: /{tool} <{arg_name}>")
             return
         await self._send(u, await self._call(tool, {arg_name: c.args[0]}, update=u))
+
+
+def _menu_main_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📊 Status", callback_data="run:status"),
+            InlineKeyboardButton("⚙️ Machine", callback_data="run:machine"),
+        ],
+        [
+            InlineKeyboardButton("📦 Apps ▸", callback_data="menu:apps"),
+            InlineKeyboardButton("📁 Repos ▸", callback_data="menu:repos"),
+        ],
+        [
+            InlineKeyboardButton("🤖 Ollama ▸", callback_data="menu:ollama"),
+            InlineKeyboardButton("🛡 Watchdog", callback_data="run:watchdog"),
+        ],
+        [
+            InlineKeyboardButton("⚡ Host ▸", callback_data="menu:host"),
+            InlineKeyboardButton("🔧 Services ▸", callback_data="menu:services"),
+        ],
+    ])
+
+
+def _menu_back_row() -> list:
+    return [InlineKeyboardButton("◂ Back", callback_data="menu:main")]
 
 
 def _chunked(text: str, n: int):
