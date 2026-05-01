@@ -111,13 +111,21 @@ exit /b %ERRORLEVEL%
 
 # --- Creds file -------------------------------------------------------------
 $credsDest = Join-Path $ConfigDir "nats.creds"
-Write-Host "==> Installing creds to $credsDest"
-if (Test-Path $credsDest) {
-    icacls $credsDest /grant "Administrators:F" | Out-Null
-    Remove-Item -Force $credsDest
+$srcResolved = (Resolve-Path $CredsFile).Path
+$dstResolved = if (Test-Path $credsDest) { (Resolve-Path $credsDest).Path } else { $credsDest }
+
+if ($srcResolved -ieq $dstResolved) {
+    Write-Host "==> Creds source is already the live creds file; just re-applying ACL"
+    icacls $credsDest /inheritance:r /grant "SYSTEM:R" "Administrators:R" | Out-Null
+} else {
+    Write-Host "==> Installing creds to $credsDest"
+    if (Test-Path $credsDest) {
+        icacls $credsDest /grant "Administrators:F" | Out-Null
+        Remove-Item -Force $credsDest
+    }
+    Copy-Item -Force $CredsFile $credsDest
+    icacls $credsDest /inheritance:r /grant "SYSTEM:R" "Administrators:R" | Out-Null
 }
-Copy-Item -Force $CredsFile $credsDest
-icacls $credsDest /inheritance:r /grant "SYSTEM:R" "Administrators:R" | Out-Null
 
 # --- agent.toml -------------------------------------------------------------
 $cfgPath = Join-Path $ConfigDir "agent.toml"
