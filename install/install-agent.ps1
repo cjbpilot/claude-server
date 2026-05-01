@@ -174,14 +174,42 @@ $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccou
 
 Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force | Out-Null
 
-Write-Host "==> Starting task"
+# --- External watchdog: separate scheduled task that probes the agent every
+# 60s and force-restarts it if it's wedged. Lives outside the agent process
+# so it can recover hangs the in-process watchdog can't catch.
+$WatchdogTaskName = "ClaudeAgentWatchdog"
+Write-Host "==> Registering scheduled task '$WatchdogTaskName' (probes agent every 60s)"
+
+if (Get-ScheduledTask -TaskName $WatchdogTaskName -ErrorAction SilentlyContinue) {
+    Stop-ScheduledTask -TaskName $WatchdogTaskName -ErrorAction SilentlyContinue
+    Unregister-ScheduledTask -TaskName $WatchdogTaskName -Confirm:$false
+}
+
+$wdAction = New-ScheduledTaskAction -Execute $venvPython -Argument "-m agent.watchdog" -WorkingDirectory $InstallDir
+$wdTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) `
+    -RepetitionInterval (New-TimeSpan -Minutes 1)
+$wdSettings = New-ScheduledTaskSettingsSet `
+    -AllowStartIfOnBatteries `
+    -DontStopIfGoingOnBatteries `
+    -StartWhenAvailable `
+    -ExecutionTimeLimit (New-TimeSpan -Minutes 2) `
+    -MultipleInstances IgnoreNew
+$wdPrincipal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+
+Register-ScheduledTask -TaskName $WatchdogTaskName -Action $wdAction -Trigger $wdTrigger `
+    -Settings $wdSettings -Principal $wdPrincipal -Force | Out-Null
+
+Write-Host "==> Starting agent task"
 Start-ScheduledTask -TaskName $TaskName
 Start-Sleep -Seconds 3
 Get-ScheduledTask -TaskName $TaskName | Select-Object TaskName, State | Format-List
+Get-ScheduledTask -TaskName $WatchdogTaskName | Select-Object TaskName, State | Format-List
 
 Write-Host ""
 Write-Host "Install complete." -ForegroundColor Green
 Write-Host "  Edit $cfgPath to register your repos, deploys, and allowed services."
 Write-Host "  Restart after edits:  schtasks /End /TN $TaskName ; schtasks /Run /TN $TaskName"
 Write-Host "  Agent log:            $ConfigDir\logs\agent.log"
-Write-Host "  Wrapper stdout/err:   $ConfigDir\logs\stdout.log / stderr.log"
+Write-Host "  Watchdog log:         $ConfigDir\logs\watchdog.log"
+Write-Host "  Watchdog state:       $ConfigDir\watchdog.json"
+Write-Host "  Watchdog probes the agent every 60s; force-restarts it on hang."

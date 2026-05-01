@@ -282,6 +282,22 @@ async def run_command(command: str, shell: str = "powershell", cwd: str | None =
 
 
 @mcp.tool()
+async def ping() -> str:
+    """Cheap liveness probe used by the external watchdog. Returns instantly
+    if the agent's NATS handler is responsive."""
+    return await _call("ping", timeout=10)
+
+
+@mcp.tool()
+async def watchdog_stats() -> str:
+    """External-watchdog statistics: how many times the agent was force-killed
+    and relaunched, plus the last few kill timestamps and reasons. The
+    watchdog runs as a separate scheduled task that probes the agent every
+    minute and force-restarts it if it doesn't respond."""
+    return await _call("watchdog_stats", timeout=10)
+
+
+@mcp.tool()
 async def tail_logs(file: str = "agent", lines: int = 100) -> str:
     """Tail one of the agent's own log files over the wire.
 

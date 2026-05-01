@@ -103,6 +103,7 @@ Read-only:
   /ollama         installed Ollama models
   /ollama_ps      currently loaded models
   /myid           show your Telegram user id
+  /watchdog       external-watchdog kill history (1h/24h/7d/all)
   /help           this message
 
 App control:
@@ -245,6 +246,7 @@ class TelegramBot:
             ("host_restart", self.cmd_host_restart),
             ("host_cancel", self.cmd_host_cancel),
             ("self_update", self.cmd_self_update),
+            ("watchdog", self.cmd_watchdog),
         ]
         for name, fn in cmds:
             app.add_handler(CommandHandler(name, fn))
@@ -402,6 +404,7 @@ class TelegramBot:
     async def cmd_ollama_ps(self, u, c):        await self._gated(u, "ollama_ps")
     async def cmd_self_update(self, u, c):      await self._gated(u, "self_update")
     async def cmd_host_cancel(self, u, c):      await self._gated(u, "host_cancel_restart")
+    async def cmd_watchdog(self, u, c):         await self._gated(u, "watchdog_stats")
 
     async def cmd_app_start(self, u, c):        await self._with_arg(u, c, "start_app", "name")
     async def cmd_app_stop(self, u, c):         await self._with_arg(u, c, "stop_app", "name")
@@ -679,6 +682,35 @@ def _fmt_host_cancel(d: dict) -> str:
     return "ℹ️ " + (d.get("note") or "no shutdown was pending")
 
 
+def _fmt_watchdog(d: dict) -> str:
+    totals = d.get("totals") or {}
+    last_probe = d.get("last_probe") or {}
+    kills = d.get("recent_kills") or []
+    L = ["Watchdog stats:"]
+    L.append(
+        f"  kills — last 1h: {totals.get('last_1h', 0)},  "
+        f"24h: {totals.get('last_24h', 0)},  "
+        f"7d: {totals.get('last_7d', 0)},  "
+        f"all-time: {totals.get('all_time', 0)}"
+    )
+    if last_probe:
+        from datetime import datetime, timezone
+        ts = last_probe.get("ts")
+        when = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%MZ") if ts else "?"
+        L.append(f"  last probe: {last_probe.get('kind', '?')} at {when}")
+    if kills:
+        L.append("\nRecent kills:")
+        from datetime import datetime, timezone
+        for k in kills[-8:]:
+            ts = k.get("ts", 0)
+            when = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%m-%d %H:%MZ")
+            L.append(f"  {when}  pid={k.get('pid_killed', '?')}  reason={k.get('reason', '?')}")
+    note = d.get("note")
+    if note:
+        L.append(f"\n{note}")
+    return "\n".join(L)
+
+
 def _fmt_telegram_status(d: dict) -> str:
     running = d.get("running")
     allow = d.get("allowlist") or []
@@ -737,4 +769,5 @@ _FORMATTERS = {
     "telegram_allow": _fmt_telegram_status,
     "telegram_revoke": _fmt_telegram_status,
     "telegram_reload": _fmt_telegram_status,
+    "watchdog_stats": _fmt_watchdog,
 }

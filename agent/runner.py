@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import sys
 import time
 from pathlib import Path
@@ -362,6 +363,25 @@ def _install_sync_connect_shim() -> None:
     _asyncio.open_connection = _patched
 
 
+_PID_PATH = Path(r"C:\ProgramData\ClaudeAgent\agent.pid")
+
+
+def _write_pid_file() -> None:
+    """Drop our PID where the external watchdog will look for it."""
+    try:
+        _PID_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _PID_PATH.write_text(str(os.getpid()), encoding="utf-8")
+    except Exception:
+        log.exception("could not write agent.pid")
+
+
+def _remove_pid_file() -> None:
+    try:
+        _PID_PATH.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
 def main() -> int:
     import signal
 
@@ -369,6 +389,7 @@ def main() -> int:
     _prevent_sleep()
     _prefer_ipv4_on_windows()
     _install_sync_connect_shim()
+    _write_pid_file()
     cfg = config.load()
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -397,6 +418,7 @@ def main() -> int:
             loop.close()
         except Exception:
             pass
+        _remove_pid_file()
     return 0
 
 

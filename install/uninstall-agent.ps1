@@ -23,6 +23,13 @@ if (-not $p.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrat
     throw "Run from an elevated PowerShell."
 }
 
+$WatchdogTaskName = "ClaudeAgentWatchdog"
+if (Get-ScheduledTask -TaskName $WatchdogTaskName -ErrorAction SilentlyContinue) {
+    Write-Host "==> Stopping watchdog task $WatchdogTaskName"
+    Stop-ScheduledTask -TaskName $WatchdogTaskName -ErrorAction SilentlyContinue
+    Unregister-ScheduledTask -TaskName $WatchdogTaskName -Confirm:$false
+}
+
 if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
     Write-Host "==> Stopping task $TaskName"
     Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue

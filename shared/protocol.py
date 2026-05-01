@@ -158,6 +158,8 @@ TOOLS = {
     "telegram_reload",
     "telegram_status",
     "run_command",
+    "ping",
+    "watchdog_stats",
     "tail_logs",
     "service_restart",
     "ollama_list",
