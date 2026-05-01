@@ -88,12 +88,16 @@ def _save_state(s: dict) -> None:
 
 
 def _compute_totals(history: list) -> dict:
+    """Counts of kills only (not all events). probe_ok / probe_fail entries
+    are still kept in history for diagnostics but don't count toward 'kills'."""
     now = time.time()
+    kills = [e for e in history if e.get("kind") == "kill"]
     return {
-        "all_time": len(history),
-        "last_1h": sum(1 for e in history if e.get("ts", 0) >= now - 3600),
-        "last_24h": sum(1 for e in history if e.get("ts", 0) >= now - 86400),
-        "last_7d": sum(1 for e in history if e.get("ts", 0) >= now - 7 * 86400),
+        "all_time": len(kills),
+        "last_1h": sum(1 for e in kills if e.get("ts", 0) >= now - 3600),
+        "last_24h": sum(1 for e in kills if e.get("ts", 0) >= now - 86400),
+        "last_7d": sum(1 for e in kills if e.get("ts", 0) >= now - 7 * 86400),
+        "probes_total": len(history),
     }
 
 
