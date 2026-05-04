@@ -94,6 +94,18 @@ Write-Host "==> Installing agent package (editable)"
 & $venvPython -m pip install -e $InstallDir
 if ($LASTEXITCODE -ne 0) { throw "editable install failed" }
 
+# --- Disable idle sleep / hibernate so the host doesn't standby --------------
+# This is policy-level (vs the per-thread SetThreadExecutionState the agent
+# also sets). Required because every agent restart releases the per-thread
+# flag for a few seconds; if the idle timer is at threshold, sleep fires
+# during that window. With timeouts at 0, idle-sleep is structurally
+# impossible regardless of what the agent process does.
+Write-Host "==> Disabling idle sleep + hibernate (server-mode power policy)"
+powercfg /change standby-timeout-ac 0    | Out-Null
+powercfg /change standby-timeout-dc 0    | Out-Null
+powercfg /change hibernate-timeout-ac 0  | Out-Null
+powercfg /change hibernate-timeout-dc 0  | Out-Null
+
 # --- Generate the launcher wrapper with baked-in paths ---------------------
 $wrapper = Join-Path $InstallDir "run-agent.cmd"
 Write-Host "==> Writing launcher $wrapper"
