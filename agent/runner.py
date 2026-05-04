@@ -271,10 +271,20 @@ def _setup_logging() -> None:
 def _prevent_sleep() -> None:
     """Tell Windows to stay awake while the agent is running.
 
-    Sets ES_CONTINUOUS | ES_SYSTEM_REQUIRED so the system does not enter
-    sleep, but allows the display to power off normally. The flag persists
-    for the calling thread (the agent's main thread) and clears
-    automatically when the process exits, so we don't need a teardown.
+    Two layers because ES_SYSTEM_REQUIRED alone is not enough on this hardware:
+
+      1. SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED) — resets
+         the standard idle sleep timer for our process's thread.
+      2. powercfg zeros the visible standby/hibernate idle timeouts AND the
+         hidden 'unattended sleep timeout' (GUID 7bc4a2f9-...). The unattended
+         timer fires when no user input is seen for N minutes (default 2h)
+         and is independent of ES_SYSTEM_REQUIRED — it sleeps the machine
+         anyway. Observed in practice on chainlocker overnight: visible
+         timeout was 0 yet event 42 fired with 'System Idle'. The unattended
+         timer was the cause.
+
+    The thread-execution flag clears when the process exits; the powercfg
+    changes persist (which is what we want — same fix is reapplied next boot).
     """
     if sys.platform != "win32":
         return
@@ -288,6 +298,38 @@ def _prevent_sleep() -> None:
         log.info("sleep prevention engaged (ES_CONTINUOUS | ES_SYSTEM_REQUIRED)")
     except Exception:
         log.exception("could not set thread execution state; machine may sleep")
+
+    import subprocess
+    UNATTENDED_SLEEP_GUID = "7bc4a2f9-d8fc-4469-b07b-33eb785aaca0"
+    timeouts = [
+        ("STANDBYIDLE", "system idle sleep"),
+        ("HIBERNATEIDLE", "hibernate idle"),
+        (UNATTENDED_SLEEP_GUID, "unattended sleep"),
+    ]
+    failures = []
+    for setting, label in timeouts:
+        for verb in ("setacvalueindex", "setdcvalueindex"):
+            try:
+                r = subprocess.run(
+                    ["powercfg", "/" + verb, "SCHEME_CURRENT", "SUB_SLEEP", setting, "0"],
+                    check=False, capture_output=True, text=True, timeout=10,
+                )
+                if r.returncode != 0:
+                    failures.append(f"{verb} {label}: rc={r.returncode}")
+            except Exception as e:
+                failures.append(f"{verb} {label}: {e!r}")
+    try:
+        subprocess.run(
+            ["powercfg", "/setactive", "SCHEME_CURRENT"],
+            check=False, capture_output=True, timeout=10,
+        )
+    except Exception:
+        log.exception("powercfg /setactive failed")
+    if failures:
+        log.warning("powercfg sleep zero: %d failures: %s",
+                    len(failures), "; ".join(failures[:6]))
+    else:
+        log.info("powercfg sleep timeouts zeroed (standby/hibernate/unattended)")
 
 
 def _prefer_ipv4_on_windows() -> None:
