@@ -42,6 +42,13 @@ class Runner:
         except Exception:
             log.exception("could not construct TelegramBot (telegram lib missing?)")
             self.telegram = None
+        # Embedded admin UI: optional, fails open if aiohttp missing.
+        try:
+            from agent.admin_ui import AdminServer
+            self.admin_ui = AdminServer(cfg, self)
+        except Exception:
+            log.exception("could not construct AdminServer (aiohttp missing?)")
+            self.admin_ui = None
 
     def spawn(self, coro) -> None:
         """Fire-and-forget a background coroutine tied to the runner."""
@@ -228,9 +235,21 @@ class Runner:
                 except Exception:
                     log.exception("telegram bot failed to start")
 
+            # Optional embedded admin UI.
+            if self.admin_ui is not None:
+                try:
+                    await self.admin_ui.start()
+                except Exception:
+                    log.exception("admin UI failed to start")
+
             await self._stop.wait()
             await self._publish_event("stopping", self._stop_reason or "stop requested")
         finally:
+            if self.admin_ui is not None:
+                try:
+                    await self.admin_ui.stop()
+                except Exception:
+                    log.exception("admin UI stop failed")
             if self.telegram is not None:
                 try:
                     await self.telegram.stop()
