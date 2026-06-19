@@ -44,6 +44,117 @@ LOG_DIR = Path(r"C:\ProgramData\ClaudeAgent\logs")
 LOG_ROTATE_BYTES = 10 * 1024 * 1024
 SUPERVISOR_INTERVAL_S = 5
 
+# After we kill the previous app process on Windows, the OS may need a beat
+# to flush file handles. Until then, build commands that touch the same
+# files (mvn clean over target/*.jar, dotnet build over bin/*.dll, etc.)
+# will fail with "Failed to delete ...". We poll for write-openability on
+# these artifact paths instead of guessing how long to sleep.
+_LOCK_PROBE_EXTS = (".jar", ".dll", ".exe", ".pyd", ".so")
+_LOCK_PROBE_DIRS = ("target", "bin", "build", "dist", "out")
+_LOCK_WAIT_MAX_S = 30.0
+
+
+def _is_file_locked(path: Path) -> bool:
+    """Return True iff something else has `path` open with sharing that
+    blocks a write-open. On POSIX this is effectively always False (open
+    files are deletable), which matches the production behaviour we care
+    about — the race only bites on Windows. The function is still safe to
+    call cross-platform so callers don't need a guard.
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        flags = os.O_RDWR | getattr(os, "O_BINARY", 0)
+        fd = os.open(str(path), flags)
+    except FileNotFoundError:
+        return False
+    except (PermissionError, OSError):
+        return True
+    os.close(fd)
+    return False
+
+
+def _collect_probe_artifacts(cwd: Path) -> list[Path]:
+    """Find candidate build artifacts under standard output dirs of `cwd`.
+
+    Bounded scan: only the top-level files in each known dir, no recursion,
+    no symlink follow. We're looking for the file mvn/dotnet/etc. is about
+    to delete, not for an exhaustive inventory.
+    """
+    out: list[Path] = []
+    for sub in _LOCK_PROBE_DIRS:
+        d = cwd / sub
+        if not d.is_dir():
+            continue
+        try:
+            for entry in d.iterdir():
+                if entry.is_file() and entry.suffix.lower() in _LOCK_PROBE_EXTS:
+                    out.append(entry)
+        except OSError:
+            continue
+    return out
+
+
+def _artifact_mtimes(cwd: Path) -> dict[str, float]:
+    """Snapshot {path: mtime} for candidate build artifacts under cwd."""
+    out: dict[str, float] = {}
+    for p in _collect_probe_artifacts(cwd):
+        try:
+            out[str(p)] = p.stat().st_mtime
+        except OSError:
+            continue
+    return out
+
+
+def _any_artifact_advanced(cwd: Path, baseline: dict[str, float]) -> bool:
+    """True if any current artifact is newer than its baseline, or if a
+    new artifact appeared that wasn't in the baseline. Used to catch the
+    case where install rc=0 but the build produced nothing fresh — meaning
+    a relaunch would still pick up the previous commit's binary.
+    """
+    after = _artifact_mtimes(cwd)
+    if not baseline and not after:
+        # Nothing to compare and nothing produced. Build commands that
+        # don't emit jar/dll/exe (pure pip install, npm install) hit this
+        # branch — defer to install rc as the source of truth.
+        return True
+    for path, mtime in after.items():
+        prev = baseline.get(path)
+        if prev is None or mtime > prev + 0.001:
+            return True
+    return False
+
+
+async def _wait_for_artifacts_unlocked(
+    cwd: Path,
+    timeout_s: float = _LOCK_WAIT_MAX_S,
+    *,
+    sleeper=None,
+    now=None,
+) -> tuple[bool, list[str]]:
+    """Poll the standard build-output dirs until no artifact is held open.
+
+    Returns ``(ok, still_locked)``. ``ok`` is True if every probed file
+    became write-openable (or no probes existed); False on timeout. The
+    `sleeper`/`now` parameters exist so tests can drive the loop without
+    real wall time — production calls leave them as None.
+    """
+    if sys.platform != "win32":
+        return True, []
+    sleeper = sleeper or asyncio.sleep
+    now = now or time.monotonic
+    deadline = now() + timeout_s
+    delay = 0.2
+    while True:
+        artifacts = _collect_probe_artifacts(cwd)
+        still_locked = [str(p) for p in artifacts if _is_file_locked(p)]
+        if not still_locked:
+            return True, []
+        if now() >= deadline:
+            return False, still_locked
+        await sleeper(delay)
+        delay = min(delay * 1.5, 2.0)
+
 
 @dataclass
 class _Runtime:
@@ -59,6 +170,13 @@ class _Runtime:
     next_health_at: float = 0.0
     restart_history: deque = field(default_factory=lambda: deque(maxlen=64))
     next_restart_at: float = 0.0
+    # "ok", "failed", "rolled_back", "skipped", "timeout", or None if no
+    # install has run yet. "rolled_back" means a build failed (or produced
+    # no fresh artifact) and the supervisor chose NOT to relaunch the
+    # stale binary on disk.
+    install_status: Optional[str] = None
+    install_status_at: Optional[float] = None
+    install_message: Optional[str] = None
 
 
 class AppManager:
@@ -140,7 +258,9 @@ class AppManager:
         install_result = "skipped"
         if manifest.install is not None:
             rc = await self._run_install(rt)
-            install_result = "ok" if rc == 0 else f"failed rc={rc}"
+            install_result = (
+                rt.install_status if rc == 0 else f"{rt.install_status} rc={rc}"
+            )
             if rc != 0:
                 # Don't auto-start a broken install.
                 app_store.set_desired(manifest.name, "stopped")
@@ -149,6 +269,8 @@ class AppManager:
                     "name": manifest.name, "repo": repo_name,
                     "install": install_result, "started": False,
                 }
+        else:
+            self._set_install_status(rt, "skipped")
 
         ollama_result = "skipped"
         if manifest.ollama is not None:
@@ -219,6 +341,9 @@ class AppManager:
                 "restart_count_recent": len(self._recent_restarts(rt)),
                 "last_known_sha": rt.record.last_known_sha,
                 "log_path": str(self._log_path(name)),
+                "install_status": rt.install_status,
+                "install_status_at": rt.install_status_at,
+                "install_message": rt.install_message,
             })
         return out
 
@@ -249,7 +374,26 @@ class AppManager:
             rt.record = app_store.get(rt.record.name) or rt.record
             if rt.manifest.restart.on_update and rt.record.desired_state == "running":
                 if rt.manifest.install is not None:
-                    await self._run_install(rt)
+                    rc = await self._run_install(rt)
+                    if rc != 0:
+                        # The build failed (or produced no fresh artifact).
+                        # If we proceeded to restart_app now, we'd spawn
+                        # whatever's already on disk — i.e. the previous
+                        # commit's binary — and the operator would believe
+                        # the pull deployed. Keep the app down so the failure
+                        # is visible in list_apps (install_status) and the
+                        # per-app log.
+                        log.error(
+                            "app %s: install failed after pull (status=%s "
+                            "rc=%s); refusing to relaunch stale binary",
+                            rt.record.name, rt.install_status, rc,
+                        )
+                        # Best-effort: make sure the previous process is
+                        # actually stopped (it usually already is, since
+                        # _run_install terminates it before building).
+                        await self._terminate(rt.record.name)
+                        cycled.append(rt.record.name)
+                        continue
                 await self.restart_app(rt.record.name)
                 cycled.append(rt.record.name)
         return cycled
@@ -406,14 +550,74 @@ class AppManager:
         rt.started_at = None
         log.info("terminated app %s exit=%s", name, rt.last_exit_code)
 
+    def _set_install_status(
+        self, rt: _Runtime, status: str, message: Optional[str] = None,
+    ) -> None:
+        rt.install_status = status
+        rt.install_status_at = time.time()
+        rt.install_message = message
+
     async def _run_install(self, rt: _Runtime) -> int:
+        """Run the manifest's install command. Returns 0 only when the
+        install command succeeded AND produced a fresh build artifact
+        (when the build emits artifacts at all). Non-zero return means the
+        caller MUST NOT spawn the app — the binary on disk is stale.
+
+        Side effect: sets rt.install_status / install_status_at /
+        install_message to one of ``ok``, ``failed``, ``rolled_back``,
+        ``timeout`` (or leaves them untouched if no install spec is
+        configured).
+        """
         spec = rt.manifest.install
         if spec is None:
             return 0
         repo_dir = self._repo_dir(rt.record.repo_name)
         log_path = self._log_path(rt.record.name)
+
+        def _log_line(line: str) -> None:
+            try:
+                with log_path.open("ab") as f:
+                    f.write((line + "\n").encode("utf-8"))
+            except Exception:
+                pass
+
+        # The previous process can hold the very files the build wants to
+        # overwrite (target/*.jar on Maven, bin/*.dll on dotnet, etc.) and
+        # on Windows the file handle survives the process exit by a beat.
+        # mvn clean then fails with "Failed to delete ...", returns rc=1,
+        # and we'd silently relaunch the stale jar. Stop the proc and
+        # actively poll the candidate artifacts until the OS releases them.
+        just_terminated = False
+        if rt.proc is not None and rt.proc.returncode is None:
+            await self._terminate_locked(rt.record.name)
+            just_terminated = True
+        if just_terminated:
+            ok, still_locked = await _wait_for_artifacts_unlocked(repo_dir)
+            if not ok:
+                _log_line(
+                    f"--- install: gave up waiting for file handles after "
+                    f"{int(_LOCK_WAIT_MAX_S)}s; still locked: "
+                    f"{', '.join(still_locked)} ---"
+                )
+                log.error(
+                    "app %s: artifacts still locked after %.0fs: %s",
+                    rt.record.name, _LOCK_WAIT_MAX_S, still_locked,
+                )
+                # Proceed anyway — the build will fail loudly with a real
+                # error, which is still better than silently rolling back.
+                # The caller checks rc and refuses to spawn the stale jar.
+
+        # Snapshot the artifact mtimes BEFORE we run the build. If install
+        # returns rc=0 but no artifact advanced, the build effectively
+        # no-op'd and any "successful" relaunch would still be the old jar
+        # — treat it as failure too.
+        pre_install_mtimes = _artifact_mtimes(repo_dir)
+
         with log_path.open("ab") as f:
-            f.write(f"\n--- install at {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} ---\n".encode("utf-8"))
+            f.write(
+                f"\n--- install at {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} "
+                f"cwd={repo_dir} ---\n".encode("utf-8")
+            )
             f.write(f"$ {spec.command}\n".encode("utf-8"))
         env = os.environ.copy()
         try:
@@ -423,22 +627,56 @@ class AppManager:
                 env=env,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
+                stderr=subprocess.PIPE,
             )
             try:
-                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=spec.timeout_s)
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(), timeout=spec.timeout_s,
+                )
             except asyncio.TimeoutError:
                 proc.kill()
                 with log_path.open("ab") as f:
                     f.write(f"--- install timeout after {spec.timeout_s}s ---\n".encode("utf-8"))
+                self._set_install_status(
+                    rt, "timeout", f"timed out after {spec.timeout_s}s",
+                )
                 return 124
+            rc = proc.returncode if proc.returncode is not None else 0
             with log_path.open("ab") as f:
-                f.write(stdout or b"")
-                f.write(f"--- install rc={proc.returncode} ---\n".encode("utf-8"))
-            return proc.returncode or 0
+                if stdout:
+                    f.write(stdout)
+                if stderr:
+                    f.write(b"--- install stderr ---\n")
+                    f.write(stderr)
+                f.write(
+                    f"--- install rc={rc} stdout_bytes={len(stdout or b'')} "
+                    f"stderr_bytes={len(stderr or b'')} ---\n".encode("utf-8")
+                )
+            if rc != 0:
+                self._set_install_status(rt, "failed", f"install rc={rc}")
+                return rc
+            if not _any_artifact_advanced(repo_dir, pre_install_mtimes):
+                # Build said rc=0 but nothing under target/bin/etc. got
+                # newer. Almost certainly mvn clean failed silently (the
+                # file-lock symptom this whole guard exists to catch).
+                # Refuse to spawn: otherwise we'd launch the previous
+                # commit's binary and the operator would believe the pull
+                # deployed.
+                _log_line(
+                    "--- install rc=0 but no build artifact advanced; "
+                    "refusing to relaunch stale binary ---"
+                )
+                self._set_install_status(
+                    rt, "rolled_back",
+                    "install rc=0 but no build artifact advanced",
+                )
+                return 1
+            self._set_install_status(rt, "ok")
+            return 0
         except Exception as e:
             with log_path.open("ab") as f:
                 f.write(f"--- install error: {e!r} ---\n".encode("utf-8"))
+            self._set_install_status(rt, "failed", repr(e))
             return 1
 
     async def _ensure_ollama(self, rt: _Runtime) -> tuple[bool, str]:
