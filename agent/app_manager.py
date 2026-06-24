@@ -44,6 +44,122 @@ LOG_DIR = Path(r"C:\ProgramData\ClaudeAgent\logs")
 LOG_ROTATE_BYTES = 10 * 1024 * 1024
 SUPERVISOR_INTERVAL_S = 5
 
+# After we kill the previous app process on Windows, the OS may need a beat
+# to flush file handles. Until then, build commands that touch the same
+# files (mvn clean over target/*.jar, dotnet build over bin/*.dll, etc.)
+# will fail with "Failed to delete ...". We poll for write-openability on
+# these artifact paths instead of guessing how long to sleep.
+_LOCK_PROBE_EXTS = (".jar", ".dll", ".exe", ".pyd", ".so")
+_LOCK_PROBE_DIRS = ("target", "bin", "build", "dist", "out")
+_LOCK_WAIT_MAX_S = 30.0
+
+
+class MaintenanceModeError(Exception):
+    """Raised when an operator-only action is attempted on an app the
+    supervisor is currently leaving alone."""
+
+
+def _is_file_locked(path: Path) -> bool:
+    """Return True iff something else has `path` open with sharing that
+    blocks a write-open. On POSIX this is effectively always False (open
+    files are deletable), which matches the production behaviour we care
+    about — the race only bites on Windows. The function is still safe to
+    call cross-platform so callers don't need a guard.
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        flags = os.O_RDWR | getattr(os, "O_BINARY", 0)
+        fd = os.open(str(path), flags)
+    except FileNotFoundError:
+        return False
+    except (PermissionError, OSError):
+        return True
+    os.close(fd)
+    return False
+
+
+def _collect_probe_artifacts(cwd: Path) -> list[Path]:
+    """Find candidate build artifacts under standard output dirs of `cwd`.
+
+    Bounded scan: only the top-level files in each known dir, no recursion,
+    no symlink follow. We're looking for the file mvn/dotnet/etc. is about
+    to delete, not for an exhaustive inventory.
+    """
+    out: list[Path] = []
+    for sub in _LOCK_PROBE_DIRS:
+        d = cwd / sub
+        if not d.is_dir():
+            continue
+        try:
+            for entry in d.iterdir():
+                if entry.is_file() and entry.suffix.lower() in _LOCK_PROBE_EXTS:
+                    out.append(entry)
+        except OSError:
+            continue
+    return out
+
+
+def _artifact_mtimes(cwd: Path) -> dict[str, float]:
+    """Snapshot {path: mtime} for candidate build artifacts under cwd."""
+    out: dict[str, float] = {}
+    for p in _collect_probe_artifacts(cwd):
+        try:
+            out[str(p)] = p.stat().st_mtime
+        except OSError:
+            continue
+    return out
+
+
+def _any_artifact_advanced(cwd: Path, baseline: dict[str, float]) -> bool:
+    """True if any current artifact is newer than its baseline, or if a
+    new artifact appeared that wasn't in the baseline. Used to catch the
+    case where install rc=0 but the build produced nothing fresh — meaning
+    a relaunch would still pick up the previous commit's binary.
+    """
+    after = _artifact_mtimes(cwd)
+    if not baseline and not after:
+        # Nothing to compare and nothing produced. Build commands that
+        # don't emit jar/dll/exe (pure pip install, npm install) hit this
+        # branch — defer to install rc as the source of truth.
+        return True
+    for path, mtime in after.items():
+        prev = baseline.get(path)
+        if prev is None or mtime > prev + 0.001:
+            return True
+    return False
+
+
+async def _wait_for_artifacts_unlocked(
+    cwd: Path,
+    timeout_s: float = _LOCK_WAIT_MAX_S,
+    *,
+    sleeper=None,
+    now=None,
+) -> tuple[bool, list[str]]:
+    """Poll the standard build-output dirs until no artifact is held open.
+
+    Returns ``(ok, still_locked)``. ``ok`` is True if every probed file
+    became write-openable (or no probes existed); False on timeout. The
+    `sleeper`/`now` parameters exist so tests can drive the loop without
+    real wall time — production calls leave them as None.
+    """
+    if sys.platform != "win32":
+        return True, []
+    sleeper = sleeper or asyncio.sleep
+    now = now or time.monotonic
+    deadline = now() + timeout_s
+    delay = 0.2
+    while True:
+        artifacts = _collect_probe_artifacts(cwd)
+        still_locked = [str(p) for p in artifacts if _is_file_locked(p)]
+        if not still_locked:
+            return True, []
+        if now() >= deadline:
+            return False, still_locked
+        await sleeper(delay)
+        delay = min(delay * 1.5, 2.0)
+
 
 @dataclass
 class _Runtime:
@@ -59,6 +175,20 @@ class _Runtime:
     next_health_at: float = 0.0
     restart_history: deque = field(default_factory=lambda: deque(maxlen=64))
     next_restart_at: float = 0.0
+    # "ok", "failed", "rolled_back", "skipped", or None if no install has
+    # run yet. "rolled_back" means a build failed (or produced no fresh
+    # artifact) and the supervisor chose NOT to relaunch the stale binary.
+    install_status: Optional[str] = None
+    install_status_at: Optional[float] = None
+    install_message: Optional[str] = None
+
+    @property
+    def mode(self) -> str:
+        return self.record.mode
+
+    @property
+    def in_maintenance(self) -> bool:
+        return self.record.mode == "maintenance"
 
 
 class AppManager:
@@ -88,6 +218,11 @@ class AppManager:
                 log.exception("invalid stored manifest for %s; skipping", rec.name)
                 continue
             self._apps[rec.name] = _Runtime(record=rec, manifest=manifest)
+            if rec.mode == "maintenance":
+                # Parked by the operator. Don't relaunch on boot (e.g. after
+                # self_update); they'll flip mode back to 'active' when ready.
+                log.info("app %s loaded in maintenance mode; not launching", rec.name)
+                continue
             if rec.desired_state == "running":
                 await self._launch(rec.name)
 
@@ -140,7 +275,9 @@ class AppManager:
         install_result = "skipped"
         if manifest.install is not None:
             rc = await self._run_install(rt)
-            install_result = "ok" if rc == 0 else f"failed rc={rc}"
+            install_result = (
+                rt.install_status if rc == 0 else f"{rt.install_status} rc={rc}"
+            )
             if rc != 0:
                 # Don't auto-start a broken install.
                 app_store.set_desired(manifest.name, "stopped")
@@ -149,6 +286,8 @@ class AppManager:
                     "name": manifest.name, "repo": repo_name,
                     "install": install_result, "started": False,
                 }
+        else:
+            self._set_install_status(rt, "skipped")
 
         ollama_result = "skipped"
         if manifest.ollama is not None:
@@ -179,6 +318,11 @@ class AppManager:
         rt = self._apps.get(name)
         if rt is None:
             return False
+        if rt.in_maintenance:
+            raise MaintenanceModeError(
+                f"app {name!r} is in maintenance mode — "
+                f"call set_app_mode active first"
+            )
         app_store.set_desired(name, "running")
         rt.record = app_store.get(name) or rt.record
         await self._launch(name)
@@ -188,18 +332,56 @@ class AppManager:
         rt = self._apps.get(name)
         if rt is None:
             return False
+        if rt.in_maintenance:
+            raise MaintenanceModeError(
+                f"app {name!r} is in maintenance mode — "
+                f"call set_app_mode active first"
+            )
         app_store.set_desired(name, "stopped")
         rt.record = app_store.get(name) or rt.record
         await self._terminate(name)
         return True
 
     async def restart_app(self, name: str) -> bool:
-        if name not in self._apps:
+        rt = self._apps.get(name)
+        if rt is None:
             return False
+        if rt.in_maintenance:
+            raise MaintenanceModeError(
+                f"app {name!r} is in maintenance mode — "
+                f"call set_app_mode active first"
+            )
         await self._terminate(name)
         await asyncio.sleep(0.5)
         await self._launch(name)
         return True
+
+    async def set_mode(self, name: str, mode: str) -> Optional[app_store.AppRecord]:
+        """Flip an app between 'active' and 'maintenance' and persist it.
+
+        Does not start, stop, or touch the live process — flipping back to
+        'active' means the supervisor resumes its normal duties (health
+        probes, crash restarts honoring desired_state) on the next tick.
+        Returns None if the app is unknown; raises ValueError for a bad mode.
+        """
+        if mode not in app_store.VALID_MODES:
+            raise ValueError(
+                f"invalid mode {mode!r}; expected one of {app_store.VALID_MODES}"
+            )
+        rt = self._apps.get(name)
+        if rt is None:
+            return None
+        rec = app_store.set_mode(name, mode)
+        if rec is not None:
+            rt.record = rec
+            # A fresh return to 'active' should not be penalized by stale
+            # crash backoff. The supervisor will re-evaluate everything
+            # from scratch on the next tick.
+            if mode == "active":
+                rt.next_restart_at = 0.0
+                rt.next_health_at = time.time()
+        log.info("app %s mode -> %s", name, mode)
+        return rec
 
     def list_apps(self) -> list[dict]:
         out = []
@@ -210,6 +392,7 @@ class AppManager:
                 "name": name,
                 "repo": rt.record.repo_name,
                 "desired": rt.record.desired_state,
+                "mode": rt.record.mode,
                 "alive": alive,
                 "pid": rt.proc.pid if rt.proc is not None else None,
                 "uptime_s": round(uptime, 1) if uptime is not None else None,
@@ -219,6 +402,9 @@ class AppManager:
                 "restart_count_recent": len(self._recent_restarts(rt)),
                 "last_known_sha": rt.record.last_known_sha,
                 "log_path": str(self._log_path(name)),
+                "install_status": rt.install_status,
+                "install_status_at": rt.install_status_at,
+                "install_message": rt.install_message,
             })
         return out
 
@@ -245,14 +431,98 @@ class AppManager:
             # record - always cycle.
             if _looks_like_sha(known) and known == new_sha:
                 continue
+            # Record the new workspace SHA even if we won't cycle: the files
+            # on disk really are at this SHA now, so list_apps should reflect
+            # that. Maintenance mode just prevents the process cycle.
             app_store.set_last_sha(rt.record.name, new_sha)
             rt.record = app_store.get(rt.record.name) or rt.record
-            if rt.manifest.restart.on_update and rt.record.desired_state == "running":
-                if rt.manifest.install is not None:
-                    await self._run_install(rt)
-                await self.restart_app(rt.record.name)
-                cycled.append(rt.record.name)
+            if rt.in_maintenance:
+                log.info(
+                    "app %s in maintenance mode; pull recorded but not cycled",
+                    rt.record.name,
+                )
+                continue
+            if not (rt.manifest.restart.on_update and rt.record.desired_state == "running"):
+                continue
+            await self._cycle_after_pull(rt, new_sha)
+            cycled.append(rt.record.name)
         return cycled
+
+    async def _cycle_after_pull(self, rt: _Runtime, new_sha: str) -> None:
+        """Restart a managed app after its repo pulled to a new SHA.
+
+        Re-reads the manifest from the workspace repo so env, install, and
+        ollama changes in the new commit take effect this cycle (the cached
+        manifest from register_app would otherwise inject the previous
+        commit's values). Holds self._lock through the whole sequence so the
+        supervisor can't slip in and relaunch the old binary in the gap
+        between terminate and the fresh launch.
+        """
+        name = rt.record.name
+        repo_dir = self._repo_dir(rt.record.repo_name)
+        log_path = self._log_path(name)
+
+        def _log(line: str) -> None:
+            try:
+                with log_path.open("ab") as f:
+                    f.write((line + "\n").encode("utf-8"))
+            except Exception:
+                pass
+
+        async with self._lock:
+            try:
+                new_manifest = app_manifest.parse_manifest(repo_dir, default_name=name)
+                # Keep the registered name; a manifest rename in a later
+                # commit shouldn't silently rebrand an app under us.
+                new_manifest.name = name
+                rt.manifest = new_manifest
+                app_store.upsert(
+                    name=name,
+                    repo_name=rt.record.repo_name,
+                    manifest=new_manifest.to_dict(),
+                    desired_state=rt.record.desired_state,
+                )
+                rt.record = app_store.get(name) or rt.record
+                _log(f"--- manifest re-loaded after pull sha={new_sha[:12]} ---")
+            except Exception as e:
+                _log(f"--- manifest re-load failed, keeping cached: {e!r} ---")
+                log.exception("manifest re-load failed for %s", name)
+
+            if rt.manifest.install is not None:
+                # _run_install terminates the live proc and waits for OS
+                # handle release before building, so no terminate needed here.
+                rc = await self._run_install(rt)
+                if rc != 0:
+                    # The build failed (or produced no fresh artifact). If we
+                    # relaunched now, we'd spawn whatever's already on disk —
+                    # i.e. the previous commit's binary — and the operator
+                    # would believe the pull deployed. Keep the app down so
+                    # the failure is visible in list_apps (install_status)
+                    # and tail_logs.
+                    _log(
+                        f"--- install rc={rc} status={rt.install_status}; "
+                        f"NOT launching, app stays down at sha "
+                        f"{new_sha[:12]} ---"
+                    )
+                    log.error(
+                        "app %s: install failed (status=%s rc=%s); refusing "
+                        "to relaunch stale binary",
+                        name, rt.install_status, rc,
+                    )
+                    return
+            else:
+                await self._terminate_locked(name)
+                # No install step → no build artifact to verify. Mark as
+                # skipped so list_apps shows we honored the cycle.
+                self._set_install_status(rt, "skipped")
+
+            if rt.manifest.ollama is not None:
+                try:
+                    await self._ensure_ollama(rt)
+                except Exception:
+                    log.exception("ollama re-warm failed for %s", name)
+
+            await self._launch_locked(name)
 
     def tail_log(self, name: str, lines: int = 100) -> list[str]:
         path = self._log_path(name)
@@ -406,14 +676,73 @@ class AppManager:
         rt.started_at = None
         log.info("terminated app %s exit=%s", name, rt.last_exit_code)
 
+    def _set_install_status(
+        self, rt: _Runtime, status: str, message: Optional[str] = None,
+    ) -> None:
+        rt.install_status = status
+        rt.install_status_at = time.time()
+        rt.install_message = message
+
     async def _run_install(self, rt: _Runtime) -> int:
+        """Run the manifest's install command. Returns 0 only when the
+        install command succeeded AND produced a fresh build artifact
+        (when the build emits artifacts at all). Non-zero return means the
+        caller MUST NOT spawn the app — the binary on disk is stale.
+
+        Side effect: sets rt.install_status / install_status_at / install_message
+        to one of ``ok``, ``failed``, ``rolled_back``, ``timeout`` (or leaves
+        them untouched if no install spec is configured).
+        """
         spec = rt.manifest.install
         if spec is None:
             return 0
         repo_dir = self._repo_dir(rt.record.repo_name)
         log_path = self._log_path(rt.record.name)
+
+        def _log_line(line: str) -> None:
+            try:
+                with log_path.open("ab") as f:
+                    f.write((line + "\n").encode("utf-8"))
+            except Exception:
+                pass
+
+        # The previous process can hold the very files the build wants to
+        # overwrite (target/*.jar on Maven, bin/*.dll on dotnet, etc.) and
+        # on Windows the file handle survives the process exit by a beat.
+        # mvn clean then fails with "Failed to delete ...", returns rc=1,
+        # and we'd silently relaunch the stale jar. Stop the proc and
+        # actively poll the candidate artifacts until the OS releases them.
+        just_terminated = False
+        if rt.proc is not None and rt.proc.returncode is None:
+            await self._terminate_locked(rt.record.name)
+            just_terminated = True
+        if just_terminated:
+            ok, still_locked = await _wait_for_artifacts_unlocked(repo_dir)
+            if not ok:
+                _log_line(
+                    f"--- install: gave up waiting for file handles after "
+                    f"{int(_LOCK_WAIT_MAX_S)}s; still locked: "
+                    f"{', '.join(still_locked)} ---"
+                )
+                log.error(
+                    "app %s: artifacts still locked after %.0fs: %s",
+                    rt.record.name, _LOCK_WAIT_MAX_S, still_locked,
+                )
+                # Proceed anyway — the build will fail loudly with a real
+                # error, which is still better than silently rolling back.
+                # The caller checks rc and refuses to spawn the stale jar.
+
+        # Snapshot the artifact mtimes BEFORE we run the build. If install
+        # returns rc=0 but no artifact advanced, the build effectively
+        # no-op'd and any "successful" relaunch would still be the old jar
+        # — treat it as failure too.
+        pre_install_mtimes = _artifact_mtimes(repo_dir)
+
         with log_path.open("ab") as f:
-            f.write(f"\n--- install at {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} ---\n".encode("utf-8"))
+            f.write(
+                f"\n--- install at {time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} "
+                f"cwd={repo_dir} ---\n".encode("utf-8")
+            )
             f.write(f"$ {spec.command}\n".encode("utf-8"))
         env = os.environ.copy()
         try:
@@ -423,22 +752,55 @@ class AppManager:
                 env=env,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
+                stderr=subprocess.PIPE,
             )
             try:
-                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=spec.timeout_s)
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(), timeout=spec.timeout_s,
+                )
             except asyncio.TimeoutError:
                 proc.kill()
                 with log_path.open("ab") as f:
                     f.write(f"--- install timeout after {spec.timeout_s}s ---\n".encode("utf-8"))
+                self._set_install_status(
+                    rt, "timeout", f"timed out after {spec.timeout_s}s",
+                )
                 return 124
+            rc = proc.returncode if proc.returncode is not None else 0
             with log_path.open("ab") as f:
-                f.write(stdout or b"")
-                f.write(f"--- install rc={proc.returncode} ---\n".encode("utf-8"))
-            return proc.returncode or 0
+                if stdout:
+                    f.write(stdout)
+                if stderr:
+                    f.write(b"--- install stderr ---\n")
+                    f.write(stderr)
+                f.write(
+                    f"--- install rc={rc} stdout_bytes={len(stdout or b'')} "
+                    f"stderr_bytes={len(stderr or b'')} ---\n".encode("utf-8")
+                )
+            if rc != 0:
+                self._set_install_status(rt, "failed", f"install rc={rc}")
+                return rc
+            if not _any_artifact_advanced(repo_dir, pre_install_mtimes):
+                # Build said rc=0 but nothing under target/bin/etc. got newer.
+                # Almost certainly mvn clean failed silently (the file-lock
+                # symptom this whole guard exists to catch). Refuse to spawn:
+                # otherwise we'd launch the previous commit's binary and the
+                # operator would believe the pull deployed.
+                _log_line(
+                    "--- install rc=0 but no build artifact advanced; "
+                    "refusing to relaunch stale binary ---"
+                )
+                self._set_install_status(
+                    rt, "rolled_back",
+                    "install rc=0 but no build artifact advanced",
+                )
+                return 1
+            self._set_install_status(rt, "ok")
+            return 0
         except Exception as e:
             with log_path.open("ab") as f:
                 f.write(f"--- install error: {e!r} ---\n".encode("utf-8"))
+            self._set_install_status(rt, "failed", repr(e))
             return 1
 
     async def _ensure_ollama(self, rt: _Runtime) -> tuple[bool, str]:
@@ -519,6 +881,12 @@ class AppManager:
     async def _tick(self) -> None:
         now = time.time()
         for name, rt in list(self._apps.items()):
+            if rt.in_maintenance:
+                # Operator is hand-driving this app; do not spawn, terminate,
+                # health-probe, or count restart budget. State (alive/pid)
+                # remains accurate via the cheap `proc.returncode is None`
+                # check in list_apps().
+                continue
             if rt.record.desired_state != "running":
                 continue
             # Crash detection / restart.
@@ -560,3 +928,4 @@ class AppManager:
             ok = False
         rt.last_health = "ok" if ok else "fail"
         rt.last_health_at = time.time()
+

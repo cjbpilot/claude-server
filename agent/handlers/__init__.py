@@ -38,6 +38,7 @@ REGISTRY: dict[str, Handler] = {
     "start_app": app_admin.handle_start_app,
     "stop_app": app_admin.handle_stop_app,
     "restart_app": app_admin.handle_restart_app,
+    "set_app_mode": app_admin.handle_set_app_mode,
     "list_apps": app_admin.handle_list_apps,
     "app_logs": app_admin.handle_app_logs,
     "host_restart": host.handle_host_restart,

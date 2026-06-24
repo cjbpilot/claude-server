@@ -189,8 +189,21 @@ async def restart_app(name: str) -> str:
 
 
 @mcp.tool()
+async def set_app_mode(name: str, mode: str) -> str:
+    """Flip an app between 'active' (supervisor enforces desired_state) and
+    'maintenance' (supervisor leaves the app entirely alone: no spawn, no
+    terminate, no health probes, no pull-driven cycling). Use 'maintenance'
+    while you are hand-building or hand-restarting the app outside the
+    supervisor's control, so a concurrent git_pull or crash-restart doesn't
+    race with your work. Maintenance mode persists across agent restarts;
+    start_app / stop_app / restart_app are refused until you flip back to
+    'active'."""
+    return await _call("set_app_mode", {"name": name, "mode": mode})
+
+
+@mcp.tool()
 async def list_apps() -> str:
-    """List managed apps with their live status (alive/desired/pid/uptime/health)."""
+    """List managed apps with their live status (alive/desired/mode/pid/uptime/health)."""
     return await _call("list_apps")
 
 

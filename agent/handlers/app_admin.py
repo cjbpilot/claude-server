@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from agent.app_manager import MaintenanceModeError
 from shared.protocol import Command, Reply
 
 
@@ -35,7 +36,10 @@ async def handle_start_app(hctx, cmd: Command) -> Reply:
     name = (cmd.args.get("name") or "").strip()
     if not name:
         return Reply(id=cmd.id, ok=False, error="missing 'name'")
-    ok = await _mgr(hctx).start_app(name)
+    try:
+        ok = await _mgr(hctx).start_app(name)
+    except MaintenanceModeError as e:
+        return Reply(id=cmd.id, ok=False, error=str(e))
     if not ok:
         return Reply(id=cmd.id, ok=False, error=f"unknown app: {name}")
     return Reply(id=cmd.id, ok=True, data={"name": name})
@@ -45,7 +49,10 @@ async def handle_stop_app(hctx, cmd: Command) -> Reply:
     name = (cmd.args.get("name") or "").strip()
     if not name:
         return Reply(id=cmd.id, ok=False, error="missing 'name'")
-    ok = await _mgr(hctx).stop_app(name)
+    try:
+        ok = await _mgr(hctx).stop_app(name)
+    except MaintenanceModeError as e:
+        return Reply(id=cmd.id, ok=False, error=str(e))
     if not ok:
         return Reply(id=cmd.id, ok=False, error=f"unknown app: {name}")
     return Reply(id=cmd.id, ok=True, data={"name": name})
@@ -55,10 +62,31 @@ async def handle_restart_app(hctx, cmd: Command) -> Reply:
     name = (cmd.args.get("name") or "").strip()
     if not name:
         return Reply(id=cmd.id, ok=False, error="missing 'name'")
-    ok = await _mgr(hctx).restart_app(name)
+    try:
+        ok = await _mgr(hctx).restart_app(name)
+    except MaintenanceModeError as e:
+        return Reply(id=cmd.id, ok=False, error=str(e))
     if not ok:
         return Reply(id=cmd.id, ok=False, error=f"unknown app: {name}")
     return Reply(id=cmd.id, ok=True, data={"name": name})
+
+
+async def handle_set_app_mode(hctx, cmd: Command) -> Reply:
+    name = (cmd.args.get("name") or "").strip()
+    mode = (cmd.args.get("mode") or "").strip()
+    if not name:
+        return Reply(id=cmd.id, ok=False, error="missing 'name'")
+    if not mode:
+        return Reply(id=cmd.id, ok=False, error="missing 'mode' (active|maintenance)")
+    try:
+        rec = await _mgr(hctx).set_mode(name, mode)
+    except ValueError as e:
+        return Reply(id=cmd.id, ok=False, error=str(e))
+    if rec is None:
+        return Reply(id=cmd.id, ok=False, error=f"unknown app: {name}")
+    return Reply(id=cmd.id, ok=True, data={
+        "name": rec.name, "mode": rec.mode, "desired": rec.desired_state,
+    })
 
 
 async def handle_list_apps(hctx, cmd: Command) -> Reply:

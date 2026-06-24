@@ -144,6 +144,7 @@ TOOLS = {
     "start_app",
     "stop_app",
     "restart_app",
+    "set_app_mode",
     "list_apps",
     "app_logs",
     "host_restart",

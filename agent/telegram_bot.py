@@ -779,7 +779,13 @@ def _fmt_apps(rows: list) -> str:
         return "no apps registered"
     L = ["Managed apps:"]
     for a in rows:
-        state = "alive" if a.get("alive") else f"DOWN (rc={a.get('last_exit_code')})"
+        mode = a.get("mode") or "active"
+        if mode == "maintenance":
+            state = "🔧 MAINTENANCE"
+        elif a.get("alive"):
+            state = "alive"
+        else:
+            state = f"DOWN (rc={a.get('last_exit_code')})"
         line = f"  {a.get('name')}: {state} (desired={a.get('desired')})"
         bits = []
         if a.get("pid"):

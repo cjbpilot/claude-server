@@ -45,6 +45,10 @@ async def handle_status(ctx, cmd: Command) -> Reply:
                 "name": a["name"],
                 "alive": a["alive"],
                 "desired": a["desired"],
+                # "active" or "maintenance"; an external dashboard should
+                # render maintenance distinctly from desired=stopped (stopped
+                # is deliberately-off, maintenance is operator-is-working-on-it).
+                "mode": a.get("mode", "active"),
                 "pid": a["pid"],
                 "uptime_s": a["uptime_s"],
                 "last_health": a["last_health"],

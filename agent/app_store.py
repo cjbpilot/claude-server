@@ -11,6 +11,7 @@ Schema:
         "<app_name>": {
           "repo_name": "stronghold",
           "desired_state": "running" | "stopped",
+          "mode": "active" | "maintenance",
           "manifest": {...},          # AppManifest.to_dict()
           "registered_at": 1714123456,
           "updated_at": 1714123456,
@@ -18,6 +19,13 @@ Schema:
         }
       }
     }
+
+`mode` is orthogonal to `desired_state`:
+- "active" (default): supervisor enforces desired_state, restarts on crash,
+   health-probes, cycles on git_pull.
+- "maintenance": supervisor leaves the app entirely alone — no spawn, no
+   terminate, no health probes, no pull-driven cycling. Used while the
+   operator is hand-building / hand-restarting the app.
 """
 
 from __future__ import annotations
@@ -34,11 +42,15 @@ from typing import Optional
 STORE_PATH = Path(r"C:\ProgramData\ClaudeAgent\apps.json")
 
 
+VALID_MODES = ("active", "maintenance")
+
+
 @dataclass
 class AppRecord:
     name: str
     repo_name: str
     desired_state: str  # "running" | "stopped"
+    mode: str = "active"  # "active" | "maintenance"
     manifest: dict = field(default_factory=dict)
     registered_at: int = 0
     updated_at: int = 0
@@ -49,6 +61,7 @@ class AppRecord:
             "name": self.name,
             "repo_name": self.repo_name,
             "desired_state": self.desired_state,
+            "mode": self.mode,
             "manifest": self.manifest,
             "registered_at": self.registered_at,
             "updated_at": self.updated_at,
@@ -92,6 +105,10 @@ def _save_raw(obj: dict) -> None:
     _lock_acl(STORE_PATH)
 
 
+def _coerce_mode(value) -> str:
+    return value if value in VALID_MODES else "active"
+
+
 def list_records() -> list[AppRecord]:
     obj = _load_raw()
     out = []
@@ -100,6 +117,7 @@ def list_records() -> list[AppRecord]:
             name=name,
             repo_name=str(e.get("repo_name", "")),
             desired_state=str(e.get("desired_state", "stopped")),
+            mode=_coerce_mode(e.get("mode")),
             manifest=dict(e.get("manifest", {})),
             registered_at=int(e.get("registered_at", 0)),
             updated_at=int(e.get("updated_at", 0)),
@@ -116,14 +134,20 @@ def get(name: str) -> Optional[AppRecord]:
 
 
 def upsert(name: str, repo_name: str, manifest: dict,
-           desired_state: str = "running") -> AppRecord:
+           desired_state: str = "running",
+           mode: Optional[str] = None) -> AppRecord:
+    """Upsert a record. `mode` defaults to the existing value (or "active"
+    for new records); pass an explicit string to override.
+    """
     obj = _load_raw()
     apps = obj.setdefault("apps", {})
     now = int(time.time())
     existing = apps.get(name, {})
+    effective_mode = _coerce_mode(mode if mode is not None else existing.get("mode"))
     rec = {
         "repo_name": repo_name,
         "desired_state": desired_state,
+        "mode": effective_mode,
         "manifest": manifest,
         "registered_at": int(existing.get("registered_at", now)),
         "updated_at": now,
@@ -133,8 +157,9 @@ def upsert(name: str, repo_name: str, manifest: dict,
     _save_raw(obj)
     return AppRecord(
         name=name, repo_name=rec["repo_name"], desired_state=rec["desired_state"],
-        manifest=rec["manifest"], registered_at=rec["registered_at"],
-        updated_at=rec["updated_at"], last_known_sha=rec["last_known_sha"],
+        mode=rec["mode"], manifest=rec["manifest"],
+        registered_at=rec["registered_at"], updated_at=rec["updated_at"],
+        last_known_sha=rec["last_known_sha"],
     )
 
 
@@ -144,6 +169,19 @@ def set_desired(name: str, desired_state: str) -> Optional[AppRecord]:
     if name not in apps:
         return None
     apps[name]["desired_state"] = desired_state
+    apps[name]["updated_at"] = int(time.time())
+    _save_raw(obj)
+    return get(name)
+
+
+def set_mode(name: str, mode: str) -> Optional[AppRecord]:
+    if mode not in VALID_MODES:
+        raise ValueError(f"invalid mode {mode!r}; expected one of {VALID_MODES}")
+    obj = _load_raw()
+    apps = obj.setdefault("apps", {})
+    if name not in apps:
+        return None
+    apps[name]["mode"] = mode
     apps[name]["updated_at"] = int(time.time())
     _save_raw(obj)
     return get(name)
