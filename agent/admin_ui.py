@@ -28,6 +28,8 @@ Endpoints:
   POST /api/self_update
   POST /api/apps/<name>/auto_update         body: {enabled?, at_utc?, window_minutes?, ...}
   POST /api/apps/<name>/auto_update_now     fire the auto-update path now
+  POST /api/apps/<name>/product_owner       body: {enabled?, at_utc?, day_of_week?, ...}
+  POST /api/apps/<name>/product_owner_now   fire a product-owner review now
 """
 
 from __future__ import annotations
@@ -199,7 +201,7 @@ async function loadApps() {
   const sel = document.getElementById('logApp');
   const cur = sel.value;
   sel.innerHTML = '';
-  let html = '<table><thead><tr><th>name</th><th>state</th><th>pid</th><th>uptime</th><th>health</th><th>auto-update</th><th></th></tr></thead><tbody>';
+  let html = '<table><thead><tr><th>name</th><th>state</th><th>pid</th><th>uptime</th><th>health</th><th>auto-update</th><th>product-owner</th><th></th></tr></thead><tbody>';
   for (const a of j.data) {
     const stateKind = a.alive ? 'ok' : 'bad';
     const stateText = a.alive ? 'alive' : ('down (rc=' + a.last_exit_code + ')');
@@ -221,6 +223,29 @@ async function loadApps() {
     } else {
       auCell = pill('off');
     }
+    const po = a.product_owner || {};
+    let poCell = '';
+    if (po.enabled) {
+      const poResultKind = (po.last_result === 'ok') ? 'ok'
+                         : (po.last_result === 'skipped_maintenance') ? 'warn'
+                         : (po.last_result == null) ? '' : 'bad';
+      const dowLabel = (po.day_of_week === undefined || po.day_of_week === null || po.day_of_week === -1)
+                       ? 'daily'
+                       : ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'][po.day_of_week] || '?';
+      poCell = pill(dowLabel + ' ' + po.at_utc + ' UTC', 'ok');
+      if (po.last_result) {
+        poCell += ' ' + pill(po.last_result + (po.last_spec_count ? ' (' + po.last_spec_count + ')' : ''), poResultKind);
+      }
+      if (po.next_run_at) {
+        const d = new Date(po.next_run_at * 1000);
+        poCell += '<br><small>next: ' + d.toLocaleString() + '</small>';
+      }
+      if (po.last_branch) {
+        poCell += '<br><small>branch: <code>' + po.last_branch + '</code></small>';
+      }
+    } else {
+      poCell = pill('off');
+    }
     html += '<tr>' +
       '<td>' + a.name + '</td>' +
       '<td>' + pill(stateText, stateKind) + '</td>' +
@@ -228,6 +253,7 @@ async function loadApps() {
       '<td>' + fmtDuration(a.uptime_s) + '</td>' +
       '<td>' + (a.last_health ? pill(a.last_health, healthKind) : '-') + '</td>' +
       '<td>' + auCell + '</td>' +
+      '<td>' + poCell + '</td>' +
       '<td class="actions">' +
         '<button onclick="doPost(\\'/api/apps/' + a.name + '/start\\')">start</button>' +
         '<button onclick="doPost(\\'/api/apps/' + a.name + '/stop\\')">stop</button>' +
@@ -235,6 +261,9 @@ async function loadApps() {
         '<button onclick="toggleAuto(\\'' + a.name + '\\', ' + (au.enabled ? 'false' : 'true') + ')">' +
           (au.enabled ? 'auto off' : 'auto on') + '</button>' +
         '<button onclick="doPost(\\'/api/apps/' + a.name + '/auto_update_now\\')">update now</button>' +
+        '<button onclick="togglePo(\\'' + a.name + '\\', ' + (po.enabled ? 'false' : 'true') + ')">' +
+          (po.enabled ? 'PO off' : 'PO on') + '</button>' +
+        '<button onclick="doPost(\\'/api/apps/' + a.name + '/product_owner_now\\')">PO now</button>' +
       '</td></tr>';
     const o = document.createElement('option');
     o.value = a.name; o.textContent = a.name;
@@ -252,6 +281,16 @@ async function toggleAuto(name, enabled) {
   });
   const j = await r.json();
   flash(j.ok ? ('auto-update ' + (enabled ? 'enabled' : 'disabled')) : ('Error: ' + (j.error || 'failed')), j.ok);
+  setTimeout(refresh, 500);
+}
+async function togglePo(name, enabled) {
+  const r = await fetch('/api/apps/' + name + '/product_owner', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({enabled: enabled}),
+  });
+  const j = await r.json();
+  flash(j.ok ? ('product-owner ' + (enabled ? 'enabled' : 'disabled')) : ('Error: ' + (j.error || 'failed')), j.ok);
   setTimeout(refresh, 500);
 }
 async function loadRepos() {
@@ -378,6 +417,8 @@ class AdminServer:
         r.add_post("/api/apps/{name}/restart", self._wrap("restart_app", path_args={"name": "name"}))
         r.add_post("/api/apps/{name}/auto_update", self._set_auto_update)
         r.add_post("/api/apps/{name}/auto_update_now", self._auto_update_now)
+        r.add_post("/api/apps/{name}/product_owner", self._set_product_owner)
+        r.add_post("/api/apps/{name}/product_owner_now", self._product_owner_now)
         r.add_get("/api/apps/{name}/logs", self._app_logs)
         r.add_get("/api/repos", self._wrap("list_repos"))
         r.add_post("/api/repos/{name}/pull", self._wrap("git_pull", path_args={"name": "repo"}))
@@ -461,6 +502,22 @@ class AdminServer:
     async def _auto_update_now(self, request: web.Request) -> web.Response:
         name = request.match_info["name"]
         return await self._call_and_respond("auto_update_now", {"name": name})
+
+    async def _set_product_owner(self, request: web.Request) -> web.Response:
+        name = request.match_info["name"]
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        args: dict = {"name": name}
+        args.update(body)
+        return await self._call_and_respond("set_product_owner", args)
+
+    async def _product_owner_now(self, request: web.Request) -> web.Response:
+        name = request.match_info["name"]
+        return await self._call_and_respond("product_owner_now", {"name": name})
 
     async def _host_restart(self, request: web.Request) -> web.Response:
         try:

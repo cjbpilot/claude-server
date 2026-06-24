@@ -170,6 +170,109 @@ async def handle_auto_update_now(hctx, cmd: Command) -> Reply:
     return Reply(id=cmd.id, ok=True, data=result)
 
 
+_PRODUCT_OWNER_SETTABLE = {
+    "enabled": bool,
+    "day_of_week": int,
+    "at_utc": str,
+    "feedback_window_hours": int,
+    "max_specs": int,
+    "skip_if_maintenance": bool,
+    "notify_telegram": bool,
+}
+
+
+def _coerce_product_owner_partial(raw: dict) -> tuple[dict, Optional[str]]:
+    out: dict = {}
+    for key, want_type in _PRODUCT_OWNER_SETTABLE.items():
+        if key not in raw:
+            continue
+        v = raw[key]
+        if want_type is bool:
+            if isinstance(v, bool):
+                out[key] = v
+            elif isinstance(v, str):
+                lv = v.strip().lower()
+                if lv in ("true", "1", "yes", "on"):
+                    out[key] = True
+                elif lv in ("false", "0", "no", "off"):
+                    out[key] = False
+                else:
+                    return {}, f"{key}: expected bool, got {v!r}"
+            else:
+                return {}, f"{key}: expected bool, got {v!r}"
+        elif want_type is int:
+            try:
+                out[key] = int(v)
+            except (TypeError, ValueError):
+                return {}, f"{key}: expected int, got {v!r}"
+            if key == "day_of_week":
+                if not (-1 <= out[key] <= 6):
+                    return {}, "day_of_week must be -1 (daily) or 0..6 (Mon..Sun)"
+            elif key == "feedback_window_hours":
+                if not (0 <= out[key] <= 168):
+                    return {}, "feedback_window_hours must be 0..168"
+            elif key == "max_specs":
+                if not (1 <= out[key] <= 10):
+                    return {}, "max_specs must be 1..10"
+        elif want_type is str:
+            if not isinstance(v, str):
+                return {}, f"{key}: expected str, got {v!r}"
+            if key == "at_utc":
+                try:
+                    h_str, m_str = v.split(":")
+                    h, m = int(h_str), int(m_str)
+                    if not (0 <= h < 24 and 0 <= m < 60):
+                        raise ValueError
+                except (ValueError, AttributeError):
+                    return {}, f"at_utc: expected 'HH:MM' UTC, got {v!r}"
+                out[key] = f"{h:02d}:{m:02d}"
+            else:
+                out[key] = v
+    return out, None
+
+
+async def handle_set_product_owner(hctx, cmd: Command) -> Reply:
+    name = (cmd.args.get("name") or "").strip()
+    if not name:
+        return Reply(id=cmd.id, ok=False, error="missing 'name'")
+    partial = {k: v for k, v in cmd.args.items() if k != "name"}
+    if not partial:
+        return Reply(
+            id=cmd.id, ok=False,
+            error="no product-owner fields supplied; pass at least one of "
+                  "enabled, day_of_week, at_utc, feedback_window_hours, "
+                  "max_specs, skip_if_maintenance, notify_telegram",
+        )
+    clean, err = _coerce_product_owner_partial(partial)
+    if err is not None:
+        return Reply(id=cmd.id, ok=False, error=err)
+    if not clean:
+        return Reply(
+            id=cmd.id, ok=False,
+            error="no recognised product-owner fields in the request",
+        )
+    rec = await _mgr(hctx).set_product_owner(name, clean)
+    if rec is None:
+        return Reply(id=cmd.id, ok=False, error=f"unknown app: {name}")
+    return Reply(id=cmd.id, ok=True, data={
+        "name": rec.name,
+        "product_owner": rec.product_owner,
+    })
+
+
+async def handle_product_owner_now(hctx, cmd: Command) -> Reply:
+    name = (cmd.args.get("name") or "").strip()
+    if not name:
+        return Reply(id=cmd.id, ok=False, error="missing 'name'")
+    try:
+        result = await _mgr(hctx).product_owner_now(name)
+    except Exception as e:
+        return Reply(id=cmd.id, ok=False, error=repr(e))
+    if not result.get("ok"):
+        return Reply(id=cmd.id, ok=False, error=result.get("error") or "failed")
+    return Reply(id=cmd.id, ok=True, data=result)
+
+
 async def handle_set_app_mode(hctx, cmd: Command) -> Reply:
     name = (cmd.args.get("name") or "").strip()
     mode = (cmd.args.get("mode") or "").strip()

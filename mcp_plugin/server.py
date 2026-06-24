@@ -255,6 +255,58 @@ async def auto_update_now(name: str) -> str:
 
 
 @mcp.tool()
+async def set_product_owner(
+    name: str,
+    enabled: bool | None = None,
+    day_of_week: int | None = None,
+    at_utc: str | None = None,
+    feedback_window_hours: int | None = None,
+    max_specs: int | None = None,
+    skip_if_maintenance: bool | None = None,
+    notify_telegram: bool | None = None,
+) -> str:
+    """Configure the scheduled product-owner review for a managed app.
+
+    Each run gathers cheap context from the app's repo (README, CLAUDE.md,
+    recent commits, TODO/FIXME in source, existing spec proposals), asks
+    Telegram allowlist users for pain points / wishlist items, then calls
+    Claude with web_search enabled to generate `max_specs` feature
+    proposals. Each proposal is written as a markdown file under
+    `docs/product-owner/<date>-<slug>.md`, committed to a new branch
+    `product-owner/<date>`, and pushed to origin so you can open a PR
+    by hand. A summary is posted to Telegram on completion.
+
+    `day_of_week`: 0=Mon ... 6=Sun, or -1 for daily. `at_utc`: HH:MM UTC,
+    24-hour. `feedback_window_hours`: 0 to skip Telegram entirely and go
+    straight to the LLM. `max_specs`: 1..10, default 3.
+
+    Defaults: weekly on Mondays at 10:00 UTC, 6h Telegram window, 3 specs.
+
+    Requires a valid Anthropic API key at
+    C:\\ProgramData\\ClaudeAgent\\secrets\\anthropic.token (one line)."""
+    args: dict = {"name": name}
+    if enabled is not None: args["enabled"] = enabled
+    if day_of_week is not None: args["day_of_week"] = day_of_week
+    if at_utc is not None: args["at_utc"] = at_utc
+    if feedback_window_hours is not None:
+        args["feedback_window_hours"] = feedback_window_hours
+    if max_specs is not None: args["max_specs"] = max_specs
+    if skip_if_maintenance is not None:
+        args["skip_if_maintenance"] = skip_if_maintenance
+    if notify_telegram is not None: args["notify_telegram"] = notify_telegram
+    return await _call("set_product_owner", args)
+
+
+@mcp.tool()
+async def product_owner_now(name: str) -> str:
+    """Manually trigger a product-owner review for a managed app, ignoring
+    the schedule. Fire-and-forget: returns immediately while the review
+    runs in the background. Poll list_apps and inspect the per-app
+    `product_owner.last_result` / `last_run_at` to see when it finishes."""
+    return await _call("product_owner_now", {"name": name})
+
+
+@mcp.tool()
 async def list_apps() -> str:
     """List managed apps with their live status (alive/desired/mode/pid/uptime/health),
     including per-app auto_update config and the last/next scheduled run."""

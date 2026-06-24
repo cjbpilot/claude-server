@@ -67,6 +67,16 @@ VALID_AUTO_UPDATE_RESULTS = (
     "skipped_maintenance",
 )
 
+VALID_PRODUCT_OWNER_RESULTS = (
+    "ok",
+    "no_specs",
+    "no_api_key",
+    "llm_failed",
+    "git_failed",
+    "telegram_failed",
+    "skipped_maintenance",
+)
+
 
 def default_auto_update_config() -> dict:
     """Sensible defaults applied when an operator first turns auto-update on
@@ -86,6 +96,28 @@ def default_auto_update_config() -> dict:
     }
 
 
+def default_product_owner_config() -> dict:
+    """Defaults for the product-owner review cadence. day_of_week is 0=Mon
+    through 6=Sun, matching Python's time.gmtime().tm_wday. -1 means daily.
+    feedback_window_hours is how long the agent waits for Telegram replies
+    after posting its 'anything you want added?' question; 0 skips Telegram
+    entirely and goes straight to web+code synthesis."""
+    return {
+        "enabled": False,
+        "day_of_week": 0,           # Monday
+        "at_utc": "10:00",          # 11:00 BST / 06:00 ET / 03:00 PT
+        "feedback_window_hours": 6,
+        "max_specs": 3,
+        "skip_if_maintenance": True,
+        "notify_telegram": True,
+        "last_run_at": 0,
+        "last_result": None,
+        "last_message": None,
+        "last_branch": None,
+        "last_spec_count": 0,
+    }
+
+
 @dataclass
 class AppRecord:
     name: str
@@ -97,6 +129,7 @@ class AppRecord:
     updated_at: int = 0
     last_known_sha: Optional[str] = None
     auto_update: dict = field(default_factory=dict)
+    product_owner: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -109,6 +142,7 @@ class AppRecord:
             "updated_at": self.updated_at,
             "last_known_sha": self.last_known_sha,
             "auto_update": dict(self.auto_update),
+            "product_owner": dict(self.product_owner),
         }
 
 
@@ -166,6 +200,7 @@ def list_records() -> list[AppRecord]:
             updated_at=int(e.get("updated_at", 0)),
             last_known_sha=e.get("last_known_sha"),
             auto_update=dict(e.get("auto_update") or {}),
+            product_owner=dict(e.get("product_owner") or {}),
         ))
     return out
 
@@ -202,6 +237,7 @@ def upsert(name: str, repo_name: str, manifest: dict,
         "updated_at": now,
         "last_known_sha": existing.get("last_known_sha"),
         "auto_update": dict(existing.get("auto_update") or {}),
+        "product_owner": dict(existing.get("product_owner") or {}),
     }
     apps[name] = rec
     _save_raw(obj)
@@ -211,6 +247,7 @@ def upsert(name: str, repo_name: str, manifest: dict,
         registered_at=rec["registered_at"], updated_at=rec["updated_at"],
         last_known_sha=rec["last_known_sha"],
         auto_update=rec["auto_update"],
+        product_owner=rec["product_owner"],
     )
 
 
@@ -303,6 +340,67 @@ def record_auto_update_run(
     existing["last_prev_sha"] = prev_sha
     existing["last_new_sha"] = new_sha
     apps[name]["auto_update"] = existing
+    apps[name]["updated_at"] = int(time.time())
+    _save_raw(obj)
+    return get(name)
+
+
+_PRODUCT_OWNER_ALLOWED_KEYS = {
+    "enabled", "day_of_week", "at_utc", "feedback_window_hours",
+    "max_specs", "skip_if_maintenance", "notify_telegram",
+}
+
+
+def set_product_owner(name: str, partial: dict) -> Optional[AppRecord]:
+    """Merge operator-supplied product-owner config into the persisted
+    sub-document. Same shape as set_auto_update."""
+    obj = _load_raw()
+    apps = obj.setdefault("apps", {})
+    if name not in apps:
+        return None
+    existing = dict(apps[name].get("product_owner") or {})
+    if not existing:
+        existing = default_product_owner_config()
+    for k, v in partial.items():
+        if k in _PRODUCT_OWNER_ALLOWED_KEYS:
+            existing[k] = v
+    if "at_utc" in partial or "day_of_week" in partial:
+        # Reset last-run so the new slot is eligible the same day if it has
+        # not already passed — same logic as auto-update.
+        existing["last_run_at"] = 0
+    apps[name]["product_owner"] = existing
+    apps[name]["updated_at"] = int(time.time())
+    _save_raw(obj)
+    return get(name)
+
+
+def record_product_owner_run(
+    name: str,
+    result: str,
+    *,
+    message: Optional[str] = None,
+    branch: Optional[str] = None,
+    spec_count: int = 0,
+    ran_at: Optional[int] = None,
+) -> Optional[AppRecord]:
+    if result not in VALID_PRODUCT_OWNER_RESULTS:
+        raise ValueError(
+            f"invalid product-owner result {result!r}; "
+            f"expected one of {VALID_PRODUCT_OWNER_RESULTS}"
+        )
+    obj = _load_raw()
+    apps = obj.setdefault("apps", {})
+    if name not in apps:
+        return None
+    existing = dict(apps[name].get("product_owner") or {})
+    if not existing:
+        existing = default_product_owner_config()
+    existing["last_run_at"] = int(ran_at if ran_at is not None else time.time())
+    existing["last_result"] = result
+    existing["last_message"] = message
+    existing["last_branch"] = branch
+    existing["last_spec_count"] = int(spec_count)
+    apps[name]["product_owner"] = existing
     apps[name]["updated_at"] = int(time.time())
     _save_raw(obj)
     return get(name)

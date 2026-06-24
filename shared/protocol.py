@@ -147,6 +147,8 @@ TOOLS = {
     "set_app_mode",
     "set_auto_update",
     "auto_update_now",
+    "set_product_owner",
+    "product_owner_now",
     "list_apps",
     "app_logs",
     "host_restart",

@@ -403,6 +403,8 @@ class AppManager:
             uptime = (time.time() - rt.started_at) if (alive and rt.started_at) else None
             au = dict(rt.record.auto_update or {})
             au["next_run_at"] = self._auto_update_next_run_ts(rt, now)
+            po_field = dict(rt.record.product_owner or {})
+            po_field["next_run_at"] = self._product_owner_next_run_ts(rt, now)
             out.append({
                 "name": name,
                 "repo": rt.record.repo_name,
@@ -421,8 +423,37 @@ class AppManager:
                 "install_status_at": rt.install_status_at,
                 "install_message": rt.install_message,
                 "auto_update": au,
+                "product_owner": po_field,
             })
         return out
+
+    def _product_owner_next_run_ts(self, rt: _Runtime, now: float) -> Optional[int]:
+        """Compute the next product-owner run time. Honors day_of_week:
+        -1 means daily; 0-6 means a specific weekday. Returns today's
+        slot if not yet past, otherwise advances to the next eligible
+        weekday."""
+        cfg = rt.record.product_owner or {}
+        if not cfg.get("enabled"):
+            return None
+        today_ts = self._today_scheduled_ts(cfg.get("at_utc", "10:00"), now)
+        if today_ts is None:
+            return None
+        dow = int(cfg.get("day_of_week", 0))
+        last_run = int(cfg.get("last_run_at") or 0)
+        window_s = 60 * 60
+
+        def _next_eligible(start_ts: int) -> int:
+            ts = start_ts
+            for _ in range(8):
+                wd = time.gmtime(ts).tm_wday
+                if dow < 0 or wd == dow:
+                    return ts
+                ts += 86400
+            return ts
+
+        if last_run >= today_ts or now > today_ts + window_s:
+            return _next_eligible(today_ts + 86400)
+        return _next_eligible(today_ts)
 
     def _auto_update_next_run_ts(self, rt: _Runtime, now: float) -> Optional[int]:
         """When will the next auto-update fire? None if disabled or
@@ -925,12 +956,14 @@ class AppManager:
                 # the check happens inside _auto_update_due_now() so the
                 # operator can opt back in if they ever want to.
                 await self._maybe_auto_update(rt, now)
+                await self._maybe_product_owner(rt, now)
                 continue
             if rt.record.desired_state != "running":
                 # Even a stopped app should be auto-updateable so a
                 # scheduled cycle can bring a manually-stopped service back
                 # up on the fresh code without operator intervention.
                 await self._maybe_auto_update(rt, now)
+                await self._maybe_product_owner(rt, now)
                 continue
             # Crash detection / restart.
             if rt.proc is not None and rt.proc.returncode is not None:
@@ -961,6 +994,7 @@ class AppManager:
                     rt.next_health_at = now + rt.manifest.health.interval_s
 
             await self._maybe_auto_update(rt, now)
+            await self._maybe_product_owner(rt, now)
 
     async def _probe_health(self, rt: _Runtime) -> None:
         spec = rt.manifest.health
@@ -1421,6 +1455,145 @@ class AppManager:
         if rt is None:
             return None
         rec = app_store.set_auto_update(name, partial)
+        if rec is not None:
+            rt.record = rec
+        return rec
+
+    # ---------- product owner ----------
+
+    def _product_owner_cfg(self, rt: _Runtime) -> Optional[dict]:
+        cfg = rt.record.product_owner or {}
+        if not cfg.get("enabled"):
+            return None
+        return cfg
+
+    def _product_owner_due_now(self, rt: _Runtime, now: float) -> bool:
+        cfg = self._product_owner_cfg(rt)
+        if cfg is None:
+            return False
+        sched = self._today_scheduled_ts(cfg.get("at_utc", "10:00"), now)
+        if sched is None:
+            return False
+        # day-of-week gate (-1 means daily)
+        dow = int(cfg.get("day_of_week", 0))
+        if dow >= 0:
+            if time.gmtime(now).tm_wday != dow:
+                return False
+        # 60-minute window from the scheduled time; longer than auto-update's
+        # default because a product-owner run can legitimately take hours
+        # (the Telegram feedback window alone is typically 6h), but the
+        # WINDOW we use here is only "may we start"; once started the run
+        # has its own internal timing.
+        window_s = 60 * 60
+        if now < sched or now > sched + window_s:
+            return False
+        last_run = int(cfg.get("last_run_at") or 0)
+        if last_run >= sched:
+            return False
+        if rt.in_maintenance and cfg.get("skip_if_maintenance", True):
+            app_store.record_product_owner_run(
+                rt.record.name, "skipped_maintenance",
+                message="app in maintenance mode at scheduled time",
+                ran_at=int(now),
+            )
+            rt.record = app_store.get(rt.record.name) or rt.record
+            return False
+        return True
+
+    async def _maybe_product_owner(self, rt: _Runtime, now: float) -> None:
+        if not self._product_owner_due_now(rt, now):
+            return
+        # Reserve the slot BEFORE we await — a multi-hour run must not be
+        # eligible for re-trigger by the next tick while it's still going.
+        app_store.record_product_owner_run(
+            rt.record.name, "ok",  # provisional; corrected below
+            message="(in progress)",
+            ran_at=int(now),
+        )
+        rt.record = app_store.get(rt.record.name) or rt.record
+        # Run on a background task so the supervisor loop isn't blocked.
+        self.runner.spawn(self._run_product_owner(rt))
+
+    async def _run_product_owner(self, rt: _Runtime) -> dict:
+        from agent import product_owner as po  # lazy: keep import cost off boot
+
+        name = rt.record.name
+        log_path = self._log_path(name)
+
+        def _log(line: str) -> None:
+            try:
+                with log_path.open("ab") as f:
+                    f.write((line + "\n").encode("utf-8"))
+            except Exception:
+                pass
+
+        cfg = dict(rt.record.product_owner or {})
+        repo_dir = self._repo_dir(rt.record.repo_name)
+        if not (repo_dir / ".git").exists():
+            msg = f"repo dir {repo_dir} is not a git checkout"
+            _log(f"--- product-owner: {msg} ---")
+            app_store.record_product_owner_run(name, "git_failed", message=msg)
+            rt.record = app_store.get(name) or rt.record
+            return {"result": "git_failed", "message": msg}
+
+        try:
+            result = await po.run_review(self.runner, rt, repo_dir, cfg, _log)
+        except Exception as e:
+            _log(f"--- product-owner: raised: {e!r} ---")
+            log.exception("product-owner for %s raised", name)
+            app_store.record_product_owner_run(
+                name, "llm_failed", message=f"raised: {e!r}",
+            )
+            rt.record = app_store.get(name) or rt.record
+            return {"result": "llm_failed", "message": repr(e)}
+
+        app_store.record_product_owner_run(
+            name,
+            result["result"],
+            message=result.get("message"),
+            branch=result.get("branch"),
+            spec_count=int(result.get("spec_count") or 0),
+        )
+        rt.record = app_store.get(name) or rt.record
+        return result
+
+    async def product_owner_now(self, name: str) -> dict:
+        """Operator-triggered manual run. Fire-and-forget — a full review
+        can take many hours (Telegram feedback window + Claude API +
+        git push), so we spawn it and return immediately. Poll list_apps
+        and inspect the per-app `product_owner` field for completion
+        state (`last_run_at` advances when the run finishes; `last_result`
+        records the outcome).
+        """
+        rt = self._apps.get(name)
+        if rt is None:
+            return {"ok": False, "error": f"unknown app: {name}"}
+        cfg = rt.record.product_owner or {}
+        if rt.in_maintenance and cfg.get("skip_if_maintenance", True):
+            return {
+                "ok": False,
+                "error": f"app {name} is in maintenance mode; flip to active first",
+            }
+        # Mark as in-progress before we spawn so a second concurrent
+        # invocation can detect it and back off.
+        app_store.record_product_owner_run(
+            name, "ok", message="(in progress)", ran_at=int(time.time()),
+        )
+        rt.record = app_store.get(name) or rt.record
+        self.runner.spawn(self._run_product_owner(rt))
+        return {
+            "ok": True,
+            "result": "started",
+            "message": "review running in background; check list_apps for completion",
+        }
+
+    async def set_product_owner(
+        self, name: str, partial: dict,
+    ) -> Optional[app_store.AppRecord]:
+        rt = self._apps.get(name)
+        if rt is None:
+            return None
+        rec = app_store.set_product_owner(name, partial)
         if rec is not None:
             rt.record = rec
         return rec
