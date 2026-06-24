@@ -49,11 +49,12 @@ SUPERVISOR_INTERVAL_S = 5
 # after an auto-update cycle before considering it a failure and rolling
 # back. Spring Boot + Vaadin can take ~25-40s to start; 90s gives headroom.
 _AUTO_UPDATE_HEALTH_WAIT_S = 90
-# Suffix appended to stashed build artifacts during an auto-update so the
-# rollback path can find them. We DO NOT use ".bak" or ".prev" — Maven's
-# clean glob may match them and a half-stashed file in target/ would break
-# the next build.
-_AUTO_UPDATE_STASH_SUFFIX = ".prev_auto_update"
+# Where rollback artifacts live. MUST be outside the repo's build-output
+# tree because the build command (`mvn clean`, `dotnet clean`, etc.)
+# wipes that whole tree as its first step — any in-tree stash would be
+# deleted before the build even fails, leaving rollback with no JAR to
+# restore. Each app gets its own subdirectory: <STASH>/<name>/<artifact>.
+_AUTO_UPDATE_STASH_DIR = Path(r"C:\ProgramData\ClaudeAgent\stash")
 
 # After we kill the previous app process on Windows, the OS may need a beat
 # to flush file handles. Until then, build commands that touch the same
@@ -1038,12 +1039,32 @@ class AppManager:
         return _collect_probe_artifacts(repo_dir)
 
     def _stash_artifacts(self, rt: _Runtime) -> dict[str, str]:
-        """Copy current build artifacts to .prev_auto_update siblings so
-        we can restore them if the new build is broken. Returns a mapping
-        of {original_path: stash_path}, empty if there's nothing to stash."""
+        """Copy current build artifacts to a per-app stash directory under
+        C:\\ProgramData\\ClaudeAgent\\stash\\<name>\\ so the rollback path
+        can restore them after `mvn clean` (or equivalent) has nuked the
+        in-tree target/ output. Each artifact is keyed by its absolute
+        original path so _restore_artifacts can put it back exactly where
+        it was. Returns {} when there's nothing to stash."""
         stash: dict[str, str] = {}
+        stash_dir = _AUTO_UPDATE_STASH_DIR / rt.record.name
+        try:
+            stash_dir.mkdir(parents=True, exist_ok=True)
+            # Wipe any leftovers from a prior aborted run so we don't
+            # restore the WRONG generation's artifact on the next rollback.
+            for old in stash_dir.iterdir():
+                if old.is_file():
+                    try:
+                        old.unlink()
+                    except Exception:
+                        pass
+        except Exception:
+            log.exception(
+                "auto-update: cannot prepare stash dir %s "
+                "(rollback will be impossible)", stash_dir,
+            )
+            return {}
         for p in self._build_artifacts(rt):
-            backup = p.with_suffix(p.suffix + _AUTO_UPDATE_STASH_SUFFIX)
+            backup = stash_dir / p.name
             try:
                 shutil.copy2(str(p), str(backup))
                 stash[str(p)] = str(backup)
@@ -1055,10 +1076,14 @@ class AppManager:
 
     def _restore_artifacts(self, stash: dict[str, str]) -> bool:
         """Restore stashed artifacts back into the build output dirs.
-        Returns True if every entry restored cleanly."""
+        Creates the original parent directory if missing — Maven's clean
+        removes the whole target/ tree, so the directory itself may be
+        gone by the time we try to restore.
+        Returns True only if every entry restored cleanly."""
         ok = True
         for orig, backup in stash.items():
             try:
+                Path(orig).parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(backup, orig)
             except Exception:
                 log.exception("auto-update: restore %s from %s failed", orig, backup)
@@ -1066,6 +1091,7 @@ class AppManager:
         return ok
 
     def _clear_stash(self, stash: dict[str, str]) -> None:
+        """Delete the stashed copies (not the originals)."""
         for backup in stash.values():
             try:
                 Path(backup).unlink()
@@ -1294,13 +1320,22 @@ class AppManager:
     ) -> bool:
         """Restore the previous build artifacts, hard-reset the repo to
         `prev_sha`, and relaunch the app from that prev binary. Returns
-        True if the restored process is alive at the end. Skips
-        _run_install so the rolled-back JAR isn't immediately overwritten
-        by a fresh (broken) build."""
+        True if the restored process is alive at the end.
+
+        Fast path: restore the stashed JAR + git reset + relaunch. No
+        rebuild, ~5s rollback.
+
+        Fallback: if the stash is empty or restore failed (Maven cleaned
+        the dir, disk full, etc.), and prev_sha is known, run the install
+        from the rolled-back source. Slower (~90s on jeeves), but rescues
+        the case where the prev JAR isn't on disk anymore.
+        """
         from agent.handlers import git_ops
 
         name = rt.record.name
         log_line(f"--- auto-update rollback ({reason}) target sha={prev_sha[:12]} ---")
+
+        restored_ok = False
         if not stash:
             log_line("--- auto-update rollback: no stashed artifacts to restore ---")
         else:
@@ -1315,7 +1350,23 @@ class AppManager:
         else:
             log_line("--- auto-update rollback: no prev_sha known, skipping git reset ---")
 
-        # Don't run install — we just put the prev binary back. Just relaunch.
+        # If the stash didn't deliver a usable binary, rebuild from the
+        # rolled-back source so we have something to launch. _run_install
+        # already terminates the live proc and waits for file-handle
+        # release; calling it here is safe even though we may have just
+        # restored artifacts (success means the same JAR comes out the
+        # other end).
+        need_rebuild = (not restored_ok) and bool(prev_sha)
+        if need_rebuild and rt.manifest.install is not None:
+            log_line("--- auto-update rollback: rebuilding from prev sha ---")
+            rc = await self._run_install(rt)
+            if rc != 0:
+                log_line(
+                    f"--- auto-update rollback: rebuild failed (rc={rc} "
+                    f"status={rt.install_status}); app stays down ---"
+                )
+                return False
+
         async with self._lock:
             await self._terminate_locked(name)
             await self._launch_locked(name)
@@ -1326,8 +1377,6 @@ class AppManager:
                 if prev_sha:
                     app_store.set_last_sha(name, prev_sha)
                     rt.record = app_store.get(name) or rt.record
-                # Stash files served their purpose; clear them so the next
-                # build's `mvn clean` doesn't trip on them.
                 self._clear_stash(stash)
                 return True
             await asyncio.sleep(2)
