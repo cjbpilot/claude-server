@@ -15,7 +15,20 @@ Schema:
           "manifest": {...},          # AppManifest.to_dict()
           "registered_at": 1714123456,
           "updated_at": 1714123456,
-          "last_known_sha": "bbe66f3..."  # set by git_pull
+          "last_known_sha": "bbe66f3...",  # set by git_pull
+          "auto_update": {            # optional; absent = disabled
+            "enabled": false,
+            "at_utc": "05:00",        # HH:MM in UTC
+            "window_minutes": 60,     # don't fire if we wake later than this
+            "skip_if_maintenance": true,
+            "rollback_on_health_fail": true,
+            "notify_telegram": true,
+            "last_run_at": 0,         # unix; reset to 0 on each new schedule
+            "last_result": null,      # see VALID_AUTO_UPDATE_RESULTS
+            "last_message": null,
+            "last_prev_sha": null,
+            "last_new_sha": null
+          }
         }
       }
     }
@@ -44,6 +57,34 @@ STORE_PATH = Path(r"C:\ProgramData\ClaudeAgent\apps.json")
 
 VALID_MODES = ("active", "maintenance")
 
+VALID_AUTO_UPDATE_RESULTS = (
+    "ok",
+    "no_change",
+    "pull_failed",
+    "build_failed",
+    "health_failed",
+    "rolled_back",
+    "skipped_maintenance",
+)
+
+
+def default_auto_update_config() -> dict:
+    """Sensible defaults applied when an operator first turns auto-update on
+    without supplying every field."""
+    return {
+        "enabled": False,
+        "at_utc": "05:00",
+        "window_minutes": 60,
+        "skip_if_maintenance": True,
+        "rollback_on_health_fail": True,
+        "notify_telegram": True,
+        "last_run_at": 0,
+        "last_result": None,
+        "last_message": None,
+        "last_prev_sha": None,
+        "last_new_sha": None,
+    }
+
 
 @dataclass
 class AppRecord:
@@ -55,6 +96,7 @@ class AppRecord:
     registered_at: int = 0
     updated_at: int = 0
     last_known_sha: Optional[str] = None
+    auto_update: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -66,6 +108,7 @@ class AppRecord:
             "registered_at": self.registered_at,
             "updated_at": self.updated_at,
             "last_known_sha": self.last_known_sha,
+            "auto_update": dict(self.auto_update),
         }
 
 
@@ -122,6 +165,7 @@ def list_records() -> list[AppRecord]:
             registered_at=int(e.get("registered_at", 0)),
             updated_at=int(e.get("updated_at", 0)),
             last_known_sha=e.get("last_known_sha"),
+            auto_update=dict(e.get("auto_update") or {}),
         ))
     return out
 
@@ -138,6 +182,11 @@ def upsert(name: str, repo_name: str, manifest: dict,
            mode: Optional[str] = None) -> AppRecord:
     """Upsert a record. `mode` defaults to the existing value (or "active"
     for new records); pass an explicit string to override.
+
+    Preserves the auto_update sub-document across re-registers (otherwise an
+    operator who registered an app then turned on auto-update would lose the
+    setting on every git_pull's manifest re-load — register/upsert is called
+    by both code paths).
     """
     obj = _load_raw()
     apps = obj.setdefault("apps", {})
@@ -152,6 +201,7 @@ def upsert(name: str, repo_name: str, manifest: dict,
         "registered_at": int(existing.get("registered_at", now)),
         "updated_at": now,
         "last_known_sha": existing.get("last_known_sha"),
+        "auto_update": dict(existing.get("auto_update") or {}),
     }
     apps[name] = rec
     _save_raw(obj)
@@ -160,6 +210,7 @@ def upsert(name: str, repo_name: str, manifest: dict,
         mode=rec["mode"], manifest=rec["manifest"],
         registered_at=rec["registered_at"], updated_at=rec["updated_at"],
         last_known_sha=rec["last_known_sha"],
+        auto_update=rec["auto_update"],
     )
 
 
@@ -182,6 +233,76 @@ def set_mode(name: str, mode: str) -> Optional[AppRecord]:
     if name not in apps:
         return None
     apps[name]["mode"] = mode
+    apps[name]["updated_at"] = int(time.time())
+    _save_raw(obj)
+    return get(name)
+
+
+_AUTO_UPDATE_ALLOWED_KEYS = {
+    "enabled", "at_utc", "window_minutes",
+    "skip_if_maintenance", "rollback_on_health_fail", "notify_telegram",
+}
+
+
+def set_auto_update(name: str, partial: dict) -> Optional[AppRecord]:
+    """Merge `partial` into the app's auto_update sub-document and persist.
+
+    Only the operator-controlled fields can be set this way (last_run_at /
+    last_result / last_*_sha are written by record_auto_update_run as the
+    supervisor runs cycles). Unknown keys are silently dropped. Returns the
+    updated record, or None if the app is unknown.
+    """
+    obj = _load_raw()
+    apps = obj.setdefault("apps", {})
+    if name not in apps:
+        return None
+    existing = dict(apps[name].get("auto_update") or {})
+    if not existing:
+        existing = default_auto_update_config()
+    for k, v in partial.items():
+        if k in _AUTO_UPDATE_ALLOWED_KEYS:
+            existing[k] = v
+    # If the operator changed the time, clear last_run_at so today's new slot
+    # is eligible to fire (otherwise yesterday's run blocks a freshly-edited
+    # earlier-in-the-day schedule).
+    if "at_utc" in partial:
+        existing["last_run_at"] = 0
+    apps[name]["auto_update"] = existing
+    apps[name]["updated_at"] = int(time.time())
+    _save_raw(obj)
+    return get(name)
+
+
+def record_auto_update_run(
+    name: str,
+    result: str,
+    *,
+    message: Optional[str] = None,
+    prev_sha: Optional[str] = None,
+    new_sha: Optional[str] = None,
+    ran_at: Optional[int] = None,
+) -> Optional[AppRecord]:
+    """Record the outcome of an auto-update attempt. The supervisor calls
+    this every time the tick fires an update, regardless of outcome — that
+    way the rest of the day's ticks correctly see "already ran today"."""
+    if result not in VALID_AUTO_UPDATE_RESULTS:
+        raise ValueError(
+            f"invalid auto-update result {result!r}; "
+            f"expected one of {VALID_AUTO_UPDATE_RESULTS}"
+        )
+    obj = _load_raw()
+    apps = obj.setdefault("apps", {})
+    if name not in apps:
+        return None
+    existing = dict(apps[name].get("auto_update") or {})
+    if not existing:
+        existing = default_auto_update_config()
+    existing["last_run_at"] = int(ran_at if ran_at is not None else time.time())
+    existing["last_result"] = result
+    existing["last_message"] = message
+    existing["last_prev_sha"] = prev_sha
+    existing["last_new_sha"] = new_sha
+    apps[name]["auto_update"] = existing
     apps[name]["updated_at"] = int(time.time())
     _save_raw(obj)
     return get(name)

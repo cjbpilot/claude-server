@@ -202,8 +202,62 @@ async def set_app_mode(name: str, mode: str) -> str:
 
 
 @mcp.tool()
+async def set_auto_update(
+    name: str,
+    enabled: bool | None = None,
+    at_utc: str | None = None,
+    window_minutes: int | None = None,
+    skip_if_maintenance: bool | None = None,
+    rollback_on_health_fail: bool | None = None,
+    notify_telegram: bool | None = None,
+) -> str:
+    """Configure scheduled auto-update for a managed app. Each daily tick at
+    `at_utc` (UTC, HH:MM, 24-hour) pulls the app's repo and, if the SHA
+    advanced, rebuilds + relaunches. `window_minutes` caps how long after
+    the scheduled time the agent will still attempt the update — useful so
+    a host that boots at noon doesn't accidentally fire a 05:00 cycle.
+
+    Default UTC of 05:00 lands at 06:00 UK / 00:00 ET / 21:00 PT — quiet
+    across UK + US timezones. Pick a different `at_utc` for apps whose
+    audience lives elsewhere.
+
+    `rollback_on_health_fail` (default true): if the new build's /health
+    doesn't return green within ~90s the supervisor restores the prev JAR,
+    hard-resets the repo to the prev SHA, and relaunches. Set to false if
+    you'd rather diagnose forward without an automatic revert.
+
+    `skip_if_maintenance` (default true): respect set_app_mode maintenance.
+    `notify_telegram` (default true): post each non-silent outcome to every
+    allowlisted Telegram user.
+
+    Pass only the fields you want to change. The auto_update sub-document
+    is preserved across re-registers."""
+    args: dict = {"name": name}
+    if enabled is not None: args["enabled"] = enabled
+    if at_utc is not None: args["at_utc"] = at_utc
+    if window_minutes is not None: args["window_minutes"] = window_minutes
+    if skip_if_maintenance is not None:
+        args["skip_if_maintenance"] = skip_if_maintenance
+    if rollback_on_health_fail is not None:
+        args["rollback_on_health_fail"] = rollback_on_health_fail
+    if notify_telegram is not None: args["notify_telegram"] = notify_telegram
+    return await _call("set_auto_update", args)
+
+
+@mcp.tool()
+async def auto_update_now(name: str) -> str:
+    """Manually trigger the auto-update path for a managed app, ignoring
+    its scheduled time. Behaves exactly like the daily tick: git pull,
+    rebuild + cycle on SHA change, rollback on build or health failure,
+    persist last_result. Use this to smoke-test the rollback path or to
+    pull an emergency fix without waiting for the next scheduled slot."""
+    return await _call("auto_update_now", {"name": name}, timeout=600)
+
+
+@mcp.tool()
 async def list_apps() -> str:
-    """List managed apps with their live status (alive/desired/mode/pid/uptime/health)."""
+    """List managed apps with their live status (alive/desired/mode/pid/uptime/health),
+    including per-app auto_update config and the last/next scheduled run."""
     return await _call("list_apps")
 
 

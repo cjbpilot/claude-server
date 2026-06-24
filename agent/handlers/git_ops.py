@@ -97,6 +97,143 @@ async def _ensure_repo(ctx: JobContext, repo: _ResolvedRepo) -> int:
     )
 
 
+async def pull_repo_quietly(cfg, repo_name: str) -> dict:
+    """Fetch + hard-reset a registered repo, with no streaming and no
+    JobContext. Used by the supervisor's auto-update tick where there is no
+    caller to follow a job. Reuses the same auth + redaction machinery as
+    handle_git_pull so private repos work transparently.
+
+    Returns a dict:
+      {
+        "ok": bool,
+        "rc": int,
+        "prev_sha": str,
+        "new_sha": str,
+        "changed": bool,        # prev_sha != new_sha
+        "error": Optional[str], # set only if ok=False
+      }
+    """
+    import asyncio as _aio
+
+    entry = repo_store.get(repo_name)
+    if entry is None:
+        # Fallback to static config the same way _resolve() does.
+        static = cfg.repos.get(repo_name) if hasattr(cfg, "repos") else None
+        if static is None:
+            return {
+                "ok": False, "rc": -1, "prev_sha": "", "new_sha": "",
+                "changed": False, "error": f"unknown repo: {repo_name}",
+            }
+        url = static.remote
+        branch = static.branch
+        token = None
+        path = cfg.resolve_path(static.path)
+    else:
+        url = entry.url
+        branch = entry.branch
+        token = entry.token
+        path = cfg.workspace_dir / repo_name
+
+    if not (path / ".git").exists():
+        return {
+            "ok": False, "rc": -1, "prev_sha": "", "new_sha": "",
+            "changed": False,
+            "error": f"repo {repo_name!r} not cloned at {path}",
+        }
+
+    async def _rev_parse() -> str:
+        try:
+            proc = await _aio.create_subprocess_shell(
+                "git rev-parse HEAD",
+                cwd=str(path),
+                stdout=_aio.subprocess.PIPE,
+                stderr=_aio.subprocess.DEVNULL,
+            )
+            out, _ = await proc.communicate()
+            return (out or b"").decode("utf-8", errors="replace").strip()
+        except Exception:
+            return ""
+
+    prev_sha = await _rev_parse()
+
+    auth_url = _authed_url(url, token)
+    cmd_str = (
+        f'git remote set-url origin "{auth_url}" && '
+        f"git fetch origin {branch} && "
+        f'git remote set-url origin "{url}" && '
+        f"git reset --hard FETCH_HEAD"
+    )
+    try:
+        proc = await _aio.create_subprocess_shell(
+            cmd_str,
+            cwd=str(path),
+            env=_git_env(),
+            stdout=_aio.subprocess.PIPE,
+            stderr=_aio.subprocess.STDOUT,
+        )
+        try:
+            stdout, _ = await _aio.wait_for(proc.communicate(), timeout=300)
+        except _aio.TimeoutError:
+            proc.kill()
+            return {
+                "ok": False, "rc": 124, "prev_sha": prev_sha, "new_sha": prev_sha,
+                "changed": False, "error": "git fetch+reset timed out after 300s",
+            }
+        rc = proc.returncode if proc.returncode is not None else -1
+    except Exception as e:
+        return {
+            "ok": False, "rc": -1, "prev_sha": prev_sha, "new_sha": prev_sha,
+            "changed": False, "error": repr(e),
+        }
+    if rc != 0:
+        return {
+            "ok": False, "rc": rc, "prev_sha": prev_sha, "new_sha": prev_sha,
+            "changed": False,
+            "error": f"git rc={rc}: {(stdout or b'').decode('utf-8', errors='replace')[:400]}",
+        }
+    new_sha = await _rev_parse()
+    return {
+        "ok": True, "rc": 0, "prev_sha": prev_sha, "new_sha": new_sha,
+        "changed": (new_sha and new_sha != prev_sha),
+        "error": None,
+    }
+
+
+async def git_reset_hard(cfg, repo_name: str, sha: str) -> tuple[bool, str]:
+    """Hard-reset a registered repo to a specific SHA. Used by the
+    auto-update rollback path. No fetch — assumes the SHA is already in
+    the local object DB (it must be, since we got it from rev-parse HEAD a
+    moment ago).
+    """
+    import asyncio as _aio
+
+    entry = repo_store.get(repo_name)
+    if entry is None:
+        static = cfg.repos.get(repo_name) if hasattr(cfg, "repos") else None
+        if static is None:
+            return False, f"unknown repo: {repo_name}"
+        path = cfg.resolve_path(static.path)
+    else:
+        path = cfg.workspace_dir / repo_name
+    if not (path / ".git").exists():
+        return False, f"repo {repo_name!r} not cloned at {path}"
+    try:
+        proc = await _aio.create_subprocess_shell(
+            f"git reset --hard {sha}",
+            cwd=str(path),
+            env=_git_env(),
+            stdout=_aio.subprocess.PIPE,
+            stderr=_aio.subprocess.STDOUT,
+        )
+        stdout, _ = await _aio.wait_for(proc.communicate(), timeout=60)
+        rc = proc.returncode if proc.returncode is not None else -1
+    except Exception as e:
+        return False, repr(e)
+    if rc != 0:
+        return False, f"git rc={rc}: {(stdout or b'').decode('utf-8', errors='replace')[:400]}"
+    return True, ""
+
+
 async def handle_git_pull(hctx, cmd: Command) -> Reply:
     name = cmd.args.get("repo")
     repo = _resolve(hctx, name)

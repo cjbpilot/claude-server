@@ -145,6 +145,8 @@ TOOLS = {
     "stop_app",
     "restart_app",
     "set_app_mode",
+    "set_auto_update",
+    "auto_update_now",
     "list_apps",
     "app_logs",
     "host_restart",

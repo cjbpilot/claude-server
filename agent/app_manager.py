@@ -23,9 +23,11 @@ pid=N").
 from __future__ import annotations
 
 import asyncio
+import calendar
 import logging
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -43,6 +45,15 @@ log = logging.getLogger("agent.apps")
 LOG_DIR = Path(r"C:\ProgramData\ClaudeAgent\logs")
 LOG_ROTATE_BYTES = 10 * 1024 * 1024
 SUPERVISOR_INTERVAL_S = 5
+# How long (s) to wait for the app's /health endpoint to come back green
+# after an auto-update cycle before considering it a failure and rolling
+# back. Spring Boot + Vaadin can take ~25-40s to start; 90s gives headroom.
+_AUTO_UPDATE_HEALTH_WAIT_S = 90
+# Suffix appended to stashed build artifacts during an auto-update so the
+# rollback path can find them. We DO NOT use ".bak" or ".prev" — Maven's
+# clean glob may match them and a half-stashed file in target/ would break
+# the next build.
+_AUTO_UPDATE_STASH_SUFFIX = ".prev_auto_update"
 
 # After we kill the previous app process on Windows, the OS may need a beat
 # to flush file handles. Until then, build commands that touch the same
@@ -385,9 +396,12 @@ class AppManager:
 
     def list_apps(self) -> list[dict]:
         out = []
+        now = time.time()
         for name, rt in self._apps.items():
             alive = rt.proc is not None and rt.proc.returncode is None
             uptime = (time.time() - rt.started_at) if (alive and rt.started_at) else None
+            au = dict(rt.record.auto_update or {})
+            au["next_run_at"] = self._auto_update_next_run_ts(rt, now)
             out.append({
                 "name": name,
                 "repo": rt.record.repo_name,
@@ -405,8 +419,27 @@ class AppManager:
                 "install_status": rt.install_status,
                 "install_status_at": rt.install_status_at,
                 "install_message": rt.install_message,
+                "auto_update": au,
             })
         return out
+
+    def _auto_update_next_run_ts(self, rt: _Runtime, now: float) -> Optional[int]:
+        """When will the next auto-update fire? None if disabled or
+        misconfigured. Returns today's slot if not yet past, otherwise
+        tomorrow's slot."""
+        cfg = rt.record.auto_update or {}
+        if not cfg.get("enabled"):
+            return None
+        today_ts = self._today_scheduled_ts(cfg.get("at_utc", "05:00"), now)
+        if today_ts is None:
+            return None
+        window_s = max(1, int(cfg.get("window_minutes", 60))) * 60
+        last_run = int(cfg.get("last_run_at") or 0)
+        # If today's slot has already fired (or we're past the window),
+        # next-eligible is tomorrow's slot.
+        if last_run >= today_ts or now > today_ts + window_s:
+            return today_ts + 86400
+        return today_ts
 
     async def notify_pull(self, repo_name: str, new_sha: str) -> list[str]:
         """Called by git_ops after a successful pull. Restarts apps that
@@ -886,8 +919,17 @@ class AppManager:
                 # health-probe, or count restart budget. State (alive/pid)
                 # remains accurate via the cheap `proc.returncode is None`
                 # check in list_apps().
+                #
+                # Auto-update *also* skips maintenance apps (default), but
+                # the check happens inside _auto_update_due_now() so the
+                # operator can opt back in if they ever want to.
+                await self._maybe_auto_update(rt, now)
                 continue
             if rt.record.desired_state != "running":
+                # Even a stopped app should be auto-updateable so a
+                # scheduled cycle can bring a manually-stopped service back
+                # up on the fresh code without operator intervention.
+                await self._maybe_auto_update(rt, now)
                 continue
             # Crash detection / restart.
             if rt.proc is not None and rt.proc.returncode is not None:
@@ -917,6 +959,8 @@ class AppManager:
                     await self._probe_health(rt)
                     rt.next_health_at = now + rt.manifest.health.interval_s
 
+            await self._maybe_auto_update(rt, now)
+
     async def _probe_health(self, rt: _Runtime) -> None:
         spec = rt.manifest.health
         if spec is None or self._http is None:
@@ -929,3 +973,405 @@ class AppManager:
         rt.last_health = "ok" if ok else "fail"
         rt.last_health_at = time.time()
 
+    # ---------- auto-update ----------
+
+    def _auto_update_cfg(self, rt: _Runtime) -> Optional[dict]:
+        """Return the auto_update sub-document iff it's enabled. None means
+        the operator hasn't opted this app in, so the tick does nothing."""
+        cfg = rt.record.auto_update or {}
+        if not cfg.get("enabled"):
+            return None
+        return cfg
+
+    def _today_scheduled_ts(self, at_utc: str, now: float) -> Optional[int]:
+        """Convert an 'HH:MM' UTC schedule string into today's unix ts."""
+        try:
+            h_str, m_str = at_utc.split(":")
+            h, m = int(h_str), int(m_str)
+            if not (0 <= h < 24 and 0 <= m < 60):
+                return None
+        except (ValueError, AttributeError):
+            return None
+        today = time.gmtime(now)
+        return calendar.timegm((
+            today.tm_year, today.tm_mon, today.tm_mday,
+            h, m, 0, 0, 0, 0,
+        ))
+
+    def _auto_update_due_now(self, rt: _Runtime, now: float) -> bool:
+        """True iff this app's auto-update schedule fires inside its window
+        right now and we haven't already run it today."""
+        cfg = self._auto_update_cfg(rt)
+        if cfg is None:
+            return False
+        sched = self._today_scheduled_ts(cfg.get("at_utc", "05:00"), now)
+        if sched is None:
+            return False
+        window_s = max(1, int(cfg.get("window_minutes", 60))) * 60
+        if now < sched or now > sched + window_s:
+            return False
+        last_run = int(cfg.get("last_run_at") or 0)
+        if last_run >= sched:
+            return False
+        if rt.in_maintenance and cfg.get("skip_if_maintenance", True):
+            # Burn the slot so we don't keep evaluating it every tick today.
+            app_store.record_auto_update_run(
+                rt.record.name, "skipped_maintenance",
+                message="app in maintenance mode at scheduled time",
+                ran_at=int(now),
+            )
+            rt.record = app_store.get(rt.record.name) or rt.record
+            return False
+        return True
+
+    async def _maybe_auto_update(self, rt: _Runtime, now: float) -> None:
+        """Cheap per-tick gate. Fires _run_auto_update only when due."""
+        if not self._auto_update_due_now(rt, now):
+            return
+        try:
+            await self._run_auto_update(rt)
+        except Exception:
+            log.exception("auto-update for %s raised", rt.record.name)
+
+    def _build_artifacts(self, rt: _Runtime) -> list[Path]:
+        repo_dir = self._repo_dir(rt.record.repo_name)
+        return _collect_probe_artifacts(repo_dir)
+
+    def _stash_artifacts(self, rt: _Runtime) -> dict[str, str]:
+        """Copy current build artifacts to .prev_auto_update siblings so
+        we can restore them if the new build is broken. Returns a mapping
+        of {original_path: stash_path}, empty if there's nothing to stash."""
+        stash: dict[str, str] = {}
+        for p in self._build_artifacts(rt):
+            backup = p.with_suffix(p.suffix + _AUTO_UPDATE_STASH_SUFFIX)
+            try:
+                shutil.copy2(str(p), str(backup))
+                stash[str(p)] = str(backup)
+            except Exception:
+                log.exception(
+                    "auto-update: failed to stash %s (rollback will be partial)", p,
+                )
+        return stash
+
+    def _restore_artifacts(self, stash: dict[str, str]) -> bool:
+        """Restore stashed artifacts back into the build output dirs.
+        Returns True if every entry restored cleanly."""
+        ok = True
+        for orig, backup in stash.items():
+            try:
+                shutil.copy2(backup, orig)
+            except Exception:
+                log.exception("auto-update: restore %s from %s failed", orig, backup)
+                ok = False
+        return ok
+
+    def _clear_stash(self, stash: dict[str, str]) -> None:
+        for backup in stash.values():
+            try:
+                Path(backup).unlink()
+            except Exception:
+                pass
+
+    async def _wait_for_health(self, rt: _Runtime, timeout_s: float) -> bool:
+        """Poll the app's /health endpoint until it returns the expected
+        status, or until `timeout_s` has elapsed. Returns True on green.
+
+        Apps without a [health] block in their manifest can't be probed —
+        we treat "alive process" as a proxy and report green if the
+        subprocess survives the timeout.
+        """
+        spec = rt.manifest.health
+        deadline = time.monotonic() + timeout_s
+        if spec is None or self._http is None:
+            while time.monotonic() < deadline:
+                if rt.proc is None or rt.proc.returncode is not None:
+                    return False
+                await asyncio.sleep(2)
+            return rt.proc is not None and rt.proc.returncode is None
+        while time.monotonic() < deadline:
+            try:
+                r = await self._http.get(spec.url, timeout=spec.timeout_s)
+                if r.status_code == spec.expect_status:
+                    rt.last_health = "ok"
+                    rt.last_health_at = time.time()
+                    return True
+            except Exception:
+                pass
+            await asyncio.sleep(3)
+        rt.last_health = "fail"
+        rt.last_health_at = time.time()
+        return False
+
+    async def _notify_telegram(self, text: str) -> None:
+        """Broadcast a one-line message to every allowlisted Telegram user.
+        Silent no-op if the bot isn't running or there's no allowlist."""
+        tg = getattr(self.runner, "telegram", None)
+        if tg is None:
+            return
+        app = getattr(tg, "application", None)
+        if app is None:
+            return
+        ids = getattr(tg, "allowlist", set()) or set()
+        if not ids:
+            return
+        for uid in ids:
+            try:
+                await app.bot.send_message(chat_id=uid, text=text)
+            except Exception:
+                log.exception("auto-update telegram notify to %s failed", uid)
+
+    async def _run_auto_update(self, rt: _Runtime) -> None:
+        """Pull the app's repo, rebuild + relaunch if the SHA advanced, and
+        roll back on a build or health failure.
+
+        Outcomes (also persisted as `last_result` for inspection via
+        list_apps and the admin UI):
+
+          - ``no_change``           — already up to date; no Telegram.
+          - ``pull_failed``         — git refused; app left as-is.
+          - ``ok``                  — new SHA, build green, health green.
+          - ``build_failed``        — mvn rc!=0 or stale-artifact guard;
+                                     rolled back to prev JAR and prev SHA.
+          - ``health_failed``       — build green but app didn't go green;
+                                     rolled back same as build_failed.
+          - ``rolled_back``         — build_failed/health_failed where the
+                                     restore-prev-binary step itself failed
+                                     (app is in an unknown state).
+        """
+        from agent.handlers import git_ops  # lazy: handlers import this module
+
+        name = rt.record.name
+        cfg = self._auto_update_cfg(rt) or {}
+        notify = bool(cfg.get("notify_telegram", True))
+        rollback_on_health = bool(cfg.get("rollback_on_health_fail", True))
+        repo_name = rt.record.repo_name
+        log_path = self._log_path(name)
+
+        def _log(line: str) -> None:
+            try:
+                with log_path.open("ab") as f:
+                    f.write((line + "\n").encode("utf-8"))
+            except Exception:
+                pass
+
+        _log(f"--- auto-update {name} starting at "
+             f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} ---")
+
+        pull = await git_ops.pull_repo_quietly(self.cfg, repo_name)
+        prev_sha = pull.get("prev_sha") or rt.record.last_known_sha or ""
+        new_sha = pull.get("new_sha") or prev_sha
+        if not pull["ok"]:
+            err = pull.get("error") or "pull failed"
+            _log(f"auto-update pull failed: {err}")
+            app_store.record_auto_update_run(
+                name, "pull_failed", message=err,
+                prev_sha=prev_sha, new_sha=new_sha,
+            )
+            rt.record = app_store.get(name) or rt.record
+            if notify:
+                await self._notify_telegram(
+                    f"🔴 auto-update {name}: pull FAILED ({err[:120]})"
+                )
+            return
+
+        if not pull.get("changed"):
+            _log(f"auto-update: no new commits since {prev_sha[:12] or '-'}")
+            app_store.record_auto_update_run(
+                name, "no_change", message="repo already at HEAD",
+                prev_sha=prev_sha, new_sha=new_sha,
+            )
+            rt.record = app_store.get(name) or rt.record
+            return  # silent — daily "no change" pings would be noise
+
+        # SHA moved. Stash current artifacts before the cycle so we can
+        # roll back if either the build or the health probe fails.
+        stash = self._stash_artifacts(rt) if rollback_on_health else {}
+        cycle_started = time.time()
+        await self._cycle_after_pull(rt, new_sha)
+        downtime = time.time() - cycle_started
+
+        if rt.install_status != "ok":
+            # Build failed (or produced no fresh artifact). The supervisor
+            # has already kept the app down; restore prev binary + prev SHA
+            # and relaunch the previous good build.
+            if not rollback_on_health:
+                _log(f"auto-update build failed at {new_sha[:12]} "
+                     f"(status={rt.install_status}); rollback disabled, "
+                     f"app stays down")
+                app_store.record_auto_update_run(
+                    name, "build_failed",
+                    message=rt.install_message or rt.install_status,
+                    prev_sha=prev_sha, new_sha=new_sha,
+                )
+                rt.record = app_store.get(name) or rt.record
+                if notify:
+                    await self._notify_telegram(
+                        f"🔴 auto-update {name} {prev_sha[:7]} → {new_sha[:7]} "
+                        f"build FAILED ({rt.install_status}); app is DOWN"
+                    )
+                return
+            restored = await self._rollback_to(rt, prev_sha, stash, _log,
+                                                reason="build_failed")
+            terminal = "build_failed" if restored else "rolled_back"
+            app_store.record_auto_update_run(
+                name, terminal,
+                message=(rt.install_message or rt.install_status or "build failed"),
+                prev_sha=prev_sha, new_sha=new_sha,
+            )
+            rt.record = app_store.get(name) or rt.record
+            if notify:
+                if restored:
+                    await self._notify_telegram(
+                        f"🟠 auto-update {name} build FAILED at {new_sha[:7]}; "
+                        f"rolled back to {prev_sha[:7]}"
+                    )
+                else:
+                    await self._notify_telegram(
+                        f"🔴 auto-update {name}: build failed AND rollback "
+                        f"failed; app may be in an inconsistent state"
+                    )
+            return
+
+        # Build green; verify the app reports healthy on the new code.
+        healthy = await self._wait_for_health(rt, _AUTO_UPDATE_HEALTH_WAIT_S)
+        if healthy:
+            self._clear_stash(stash)
+            app_store.record_auto_update_run(
+                name, "ok",
+                message=f"downtime {downtime:.0f}s",
+                prev_sha=prev_sha, new_sha=new_sha,
+            )
+            rt.record = app_store.get(name) or rt.record
+            if notify:
+                await self._notify_telegram(
+                    f"🟢 auto-update {name} {prev_sha[:7]} → {new_sha[:7]} "
+                    f"({downtime:.0f}s downtime, health ok)"
+                )
+            return
+
+        # Built but didn't come up green within the window.
+        if not rollback_on_health:
+            _log(f"auto-update {name}: health failed at {new_sha[:12]}, "
+                 f"rollback disabled; leaving on new code")
+            app_store.record_auto_update_run(
+                name, "health_failed",
+                message=f"health probe didn't go green within "
+                        f"{_AUTO_UPDATE_HEALTH_WAIT_S}s",
+                prev_sha=prev_sha, new_sha=new_sha,
+            )
+            rt.record = app_store.get(name) or rt.record
+            if notify:
+                await self._notify_telegram(
+                    f"🟠 auto-update {name} {prev_sha[:7]} → {new_sha[:7]}: "
+                    f"built ok but HEALTH FAILED; left on new code"
+                )
+            return
+        restored = await self._rollback_to(rt, prev_sha, stash, _log,
+                                            reason="health_failed")
+        terminal = "health_failed" if restored else "rolled_back"
+        app_store.record_auto_update_run(
+            name, terminal,
+            message=f"health probe didn't go green within "
+                    f"{_AUTO_UPDATE_HEALTH_WAIT_S}s",
+            prev_sha=prev_sha, new_sha=new_sha,
+        )
+        rt.record = app_store.get(name) or rt.record
+        if notify:
+            if restored:
+                await self._notify_telegram(
+                    f"🟠 auto-update {name}: built ok but HEALTH FAILED at "
+                    f"{new_sha[:7]}; rolled back to {prev_sha[:7]}"
+                )
+            else:
+                await self._notify_telegram(
+                    f"🔴 auto-update {name}: health failed AND rollback failed; "
+                    f"app may be in an inconsistent state"
+                )
+
+    async def _rollback_to(
+        self, rt: _Runtime, prev_sha: str, stash: dict[str, str],
+        log_line, reason: str,
+    ) -> bool:
+        """Restore the previous build artifacts, hard-reset the repo to
+        `prev_sha`, and relaunch the app from that prev binary. Returns
+        True if the restored process is alive at the end. Skips
+        _run_install so the rolled-back JAR isn't immediately overwritten
+        by a fresh (broken) build."""
+        from agent.handlers import git_ops
+
+        name = rt.record.name
+        log_line(f"--- auto-update rollback ({reason}) target sha={prev_sha[:12]} ---")
+        if not stash:
+            log_line("--- auto-update rollback: no stashed artifacts to restore ---")
+        else:
+            restored_ok = self._restore_artifacts(stash)
+            if not restored_ok:
+                log_line("--- auto-update rollback: artifact restore had failures ---")
+
+        if prev_sha:
+            ok, msg = await git_ops.git_reset_hard(self.cfg, rt.record.repo_name, prev_sha)
+            if not ok:
+                log_line(f"--- auto-update rollback: git reset failed: {msg} ---")
+        else:
+            log_line("--- auto-update rollback: no prev_sha known, skipping git reset ---")
+
+        # Don't run install — we just put the prev binary back. Just relaunch.
+        async with self._lock:
+            await self._terminate_locked(name)
+            await self._launch_locked(name)
+        # Best-effort: did we come back up?
+        alive_deadline = time.monotonic() + 30
+        while time.monotonic() < alive_deadline:
+            if rt.proc is not None and rt.proc.returncode is None:
+                if prev_sha:
+                    app_store.set_last_sha(name, prev_sha)
+                    rt.record = app_store.get(name) or rt.record
+                # Stash files served their purpose; clear them so the next
+                # build's `mvn clean` doesn't trip on them.
+                self._clear_stash(stash)
+                return True
+            await asyncio.sleep(2)
+        return False
+
+    async def auto_update_now(self, name: str) -> dict:
+        """Operator-triggered manual run. Ignores the scheduled-time gate
+        but otherwise behaves exactly like the daily tick (so the same
+        rollback paths get exercised). Used by smoke tests and by
+        emergency 'pull the new fix right now' operations.
+        """
+        rt = self._apps.get(name)
+        if rt is None:
+            return {"ok": False, "error": f"unknown app: {name}"}
+        # Don't honor `enabled=False` for a manual trigger — operator
+        # explicitly asked for it. But DO honor maintenance mode unless
+        # they flipped that off.
+        cfg = rt.record.auto_update or {}
+        if rt.in_maintenance and cfg.get("skip_if_maintenance", True):
+            return {
+                "ok": False,
+                "error": f"app {name} is in maintenance mode; flip to active first",
+            }
+        await self._run_auto_update(rt)
+        # Re-read the record so callers see the persisted last_* fields.
+        rec = app_store.get(name)
+        if rec is None:
+            return {"ok": True, "result": None}
+        return {
+            "ok": True,
+            "result": (rec.auto_update or {}).get("last_result"),
+            "message": (rec.auto_update or {}).get("last_message"),
+            "prev_sha": (rec.auto_update or {}).get("last_prev_sha"),
+            "new_sha": (rec.auto_update or {}).get("last_new_sha"),
+            "ran_at": (rec.auto_update or {}).get("last_run_at"),
+        }
+
+    async def set_auto_update(self, name: str, partial: dict) -> Optional[app_store.AppRecord]:
+        """Merge operator-supplied auto-update config into the persisted
+        record and refresh the live runtime."""
+        rt = self._apps.get(name)
+        if rt is None:
+            return None
+        rec = app_store.set_auto_update(name, partial)
+        if rec is not None:
+            rt.record = rec
+        return rec

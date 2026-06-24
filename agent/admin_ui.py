@@ -26,6 +26,8 @@ Endpoints:
   POST /api/host/restart?delay_s=30
   POST /api/host/cancel
   POST /api/self_update
+  POST /api/apps/<name>/auto_update         body: {enabled?, at_utc?, window_minutes?, ...}
+  POST /api/apps/<name>/auto_update_now     fire the auto-update path now
 """
 
 from __future__ import annotations
@@ -197,21 +199,42 @@ async function loadApps() {
   const sel = document.getElementById('logApp');
   const cur = sel.value;
   sel.innerHTML = '';
-  let html = '<table><thead><tr><th>name</th><th>state</th><th>pid</th><th>uptime</th><th>health</th><th></th></tr></thead><tbody>';
+  let html = '<table><thead><tr><th>name</th><th>state</th><th>pid</th><th>uptime</th><th>health</th><th>auto-update</th><th></th></tr></thead><tbody>';
   for (const a of j.data) {
     const stateKind = a.alive ? 'ok' : 'bad';
     const stateText = a.alive ? 'alive' : ('down (rc=' + a.last_exit_code + ')');
     const healthKind = a.last_health === 'ok' ? 'ok' : (a.last_health === 'fail' ? 'bad' : '');
+    const au = a.auto_update || {};
+    let auCell = '';
+    if (au.enabled) {
+      const resultKind = (au.last_result === 'ok' || au.last_result === 'no_change') ? 'ok'
+                       : (au.last_result === 'skipped_maintenance') ? 'warn'
+                       : (au.last_result == null) ? '' : 'bad';
+      auCell = pill(au.at_utc + ' UTC', 'ok');
+      if (au.last_result) {
+        auCell += ' ' + pill(au.last_result, resultKind);
+      }
+      if (au.next_run_at) {
+        const d = new Date(au.next_run_at * 1000);
+        auCell += '<br><small>next: ' + d.toLocaleString() + '</small>';
+      }
+    } else {
+      auCell = pill('off');
+    }
     html += '<tr>' +
       '<td>' + a.name + '</td>' +
       '<td>' + pill(stateText, stateKind) + '</td>' +
       '<td>' + (a.pid || '-') + '</td>' +
       '<td>' + fmtDuration(a.uptime_s) + '</td>' +
       '<td>' + (a.last_health ? pill(a.last_health, healthKind) : '-') + '</td>' +
+      '<td>' + auCell + '</td>' +
       '<td class="actions">' +
         '<button onclick="doPost(\\'/api/apps/' + a.name + '/start\\')">start</button>' +
         '<button onclick="doPost(\\'/api/apps/' + a.name + '/stop\\')">stop</button>' +
         '<button onclick="doPost(\\'/api/apps/' + a.name + '/restart\\')">restart</button>' +
+        '<button onclick="toggleAuto(\\'' + a.name + '\\', ' + (au.enabled ? 'false' : 'true') + ')">' +
+          (au.enabled ? 'auto off' : 'auto on') + '</button>' +
+        '<button onclick="doPost(\\'/api/apps/' + a.name + '/auto_update_now\\')">update now</button>' +
       '</td></tr>';
     const o = document.createElement('option');
     o.value = a.name; o.textContent = a.name;
@@ -220,6 +243,16 @@ async function loadApps() {
   html += '</tbody></table>';
   document.getElementById('appsBox').innerHTML = html;
   if (cur) sel.value = cur;
+}
+async function toggleAuto(name, enabled) {
+  const r = await fetch('/api/apps/' + name + '/auto_update', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({enabled: enabled}),
+  });
+  const j = await r.json();
+  flash(j.ok ? ('auto-update ' + (enabled ? 'enabled' : 'disabled')) : ('Error: ' + (j.error || 'failed')), j.ok);
+  setTimeout(refresh, 500);
 }
 async function loadRepos() {
   const j = await getJSON('/api/repos');
@@ -343,6 +376,8 @@ class AdminServer:
         r.add_post("/api/apps/{name}/start", self._wrap("start_app", path_args={"name": "name"}))
         r.add_post("/api/apps/{name}/stop", self._wrap("stop_app", path_args={"name": "name"}))
         r.add_post("/api/apps/{name}/restart", self._wrap("restart_app", path_args={"name": "name"}))
+        r.add_post("/api/apps/{name}/auto_update", self._set_auto_update)
+        r.add_post("/api/apps/{name}/auto_update_now", self._auto_update_now)
         r.add_get("/api/apps/{name}/logs", self._app_logs)
         r.add_get("/api/repos", self._wrap("list_repos"))
         r.add_post("/api/repos/{name}/pull", self._wrap("git_pull", path_args={"name": "repo"}))
@@ -410,6 +445,22 @@ class AdminServer:
             "machine_stats",
             {"window_minutes": minutes, "top_processes": 6},
         )
+
+    async def _set_auto_update(self, request: web.Request) -> web.Response:
+        name = request.match_info["name"]
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            body = {}
+        args: dict = {"name": name}
+        args.update(body)
+        return await self._call_and_respond("set_auto_update", args)
+
+    async def _auto_update_now(self, request: web.Request) -> web.Response:
+        name = request.match_info["name"]
+        return await self._call_and_respond("auto_update_now", {"name": name})
 
     async def _host_restart(self, request: web.Request) -> web.Response:
         try:
