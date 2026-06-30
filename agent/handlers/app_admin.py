@@ -75,6 +75,10 @@ async def handle_restart_app(hctx, cmd: Command) -> Reply:
 
 _AUTO_UPDATE_SETTABLE = {
     "enabled": bool,
+    # `at_local` is the canonical machine-local-clock schedule. `at_utc`
+    # is accepted on writes for back-compat (and translated inside
+    # app_store.set_auto_update). Either way the value is "HH:MM" 24-hour.
+    "at_local": str,
     "at_utc": str,
     "window_minutes": int,
     "skip_if_maintenance": bool,
@@ -114,14 +118,14 @@ def _coerce_auto_update_partial(raw: dict) -> tuple[dict, Optional[str]]:
         elif want_type is str:
             if not isinstance(v, str):
                 return {}, f"{key}: expected str, got {v!r}"
-            if key == "at_utc":
+            if key in ("at_local", "at_utc"):
                 try:
                     h_str, m_str = v.split(":")
                     h, m = int(h_str), int(m_str)
                     if not (0 <= h < 24 and 0 <= m < 60):
                         raise ValueError
                 except (ValueError, AttributeError):
-                    return {}, f"at_utc: expected 'HH:MM' in 24-hour UTC, got {v!r}"
+                    return {}, f"{key}: expected 'HH:MM' 24-hour, got {v!r}"
                 out[key] = f"{h:02d}:{m:02d}"
             else:
                 out[key] = v
@@ -137,7 +141,7 @@ async def handle_set_auto_update(hctx, cmd: Command) -> Reply:
         return Reply(
             id=cmd.id, ok=False,
             error="no auto-update fields supplied; pass at least one of "
-                  "enabled, at_utc, window_minutes, skip_if_maintenance, "
+                  "enabled, at_local, window_minutes, skip_if_maintenance, "
                   "rollback_on_health_fail, notify_telegram",
         )
     clean, err = _coerce_auto_update_partial(partial)
@@ -173,6 +177,7 @@ async def handle_auto_update_now(hctx, cmd: Command) -> Reply:
 _PRODUCT_OWNER_SETTABLE = {
     "enabled": bool,
     "day_of_week": int,
+    "at_local": str,
     "at_utc": str,
     "feedback_window_hours": int,
     "max_specs": int,
@@ -217,14 +222,14 @@ def _coerce_product_owner_partial(raw: dict) -> tuple[dict, Optional[str]]:
         elif want_type is str:
             if not isinstance(v, str):
                 return {}, f"{key}: expected str, got {v!r}"
-            if key == "at_utc":
+            if key in ("at_local", "at_utc"):
                 try:
                     h_str, m_str = v.split(":")
                     h, m = int(h_str), int(m_str)
                     if not (0 <= h < 24 and 0 <= m < 60):
                         raise ValueError
                 except (ValueError, AttributeError):
-                    return {}, f"at_utc: expected 'HH:MM' UTC, got {v!r}"
+                    return {}, f"{key}: expected 'HH:MM' 24-hour, got {v!r}"
                 out[key] = f"{h:02d}:{m:02d}"
             else:
                 out[key] = v
@@ -240,7 +245,7 @@ async def handle_set_product_owner(hctx, cmd: Command) -> Reply:
         return Reply(
             id=cmd.id, ok=False,
             error="no product-owner fields supplied; pass at least one of "
-                  "enabled, day_of_week, at_utc, feedback_window_hours, "
+                  "enabled, day_of_week, at_local, feedback_window_hours, "
                   "max_specs, skip_if_maintenance, notify_telegram",
         )
     clean, err = _coerce_product_owner_partial(partial)

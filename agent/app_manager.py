@@ -435,7 +435,9 @@ class AppManager:
         cfg = rt.record.product_owner or {}
         if not cfg.get("enabled"):
             return None
-        today_ts = self._today_scheduled_ts(cfg.get("at_utc", "10:00"), now)
+        today_ts = self._today_scheduled_ts(
+            cfg.get("at_local") or cfg.get("at_utc", "10:00"), now,
+        )
         if today_ts is None:
             return None
         dow = int(cfg.get("day_of_week", 0))
@@ -445,7 +447,7 @@ class AppManager:
         def _next_eligible(start_ts: int) -> int:
             ts = start_ts
             for _ in range(8):
-                wd = time.gmtime(ts).tm_wday
+                wd = time.localtime(ts).tm_wday
                 if dow < 0 or wd == dow:
                     return ts
                 ts += 86400
@@ -462,7 +464,9 @@ class AppManager:
         cfg = rt.record.auto_update or {}
         if not cfg.get("enabled"):
             return None
-        today_ts = self._today_scheduled_ts(cfg.get("at_utc", "05:00"), now)
+        today_ts = self._today_scheduled_ts(
+            cfg.get("at_local") or cfg.get("at_utc", "05:00"), now,
+        )
         if today_ts is None:
             return None
         window_s = max(1, int(cfg.get("window_minutes", 60))) * 60
@@ -1018,20 +1022,25 @@ class AppManager:
             return None
         return cfg
 
-    def _today_scheduled_ts(self, at_utc: str, now: float) -> Optional[int]:
-        """Convert an 'HH:MM' UTC schedule string into today's unix ts."""
+    def _today_scheduled_ts(self, at_local: str, now: float) -> Optional[int]:
+        """Convert an 'HH:MM' LOCAL-clock schedule string into today's unix
+        ts. Uses time.localtime() to get today's calendar date in the
+        machine's TZ, then time.mktime() with dst=-1 so the C library
+        resolves the DST flag automatically — this means "05:00" fires at
+        5am wall-clock both during BST and during GMT, no operator
+        intervention at the autumn switchover."""
         try:
-            h_str, m_str = at_utc.split(":")
+            h_str, m_str = at_local.split(":")
             h, m = int(h_str), int(m_str)
             if not (0 <= h < 24 and 0 <= m < 60):
                 return None
         except (ValueError, AttributeError):
             return None
-        today = time.gmtime(now)
-        return calendar.timegm((
+        today = time.localtime(now)
+        return int(time.mktime((
             today.tm_year, today.tm_mon, today.tm_mday,
-            h, m, 0, 0, 0, 0,
-        ))
+            h, m, 0, 0, 0, -1,
+        )))
 
     def _auto_update_due_now(self, rt: _Runtime, now: float) -> bool:
         """True iff this app's auto-update schedule fires inside its window
@@ -1039,7 +1048,9 @@ class AppManager:
         cfg = self._auto_update_cfg(rt)
         if cfg is None:
             return False
-        sched = self._today_scheduled_ts(cfg.get("at_utc", "05:00"), now)
+        sched = self._today_scheduled_ts(
+            cfg.get("at_local") or cfg.get("at_utc", "05:00"), now,
+        )
         if sched is None:
             return False
         window_s = max(1, int(cfg.get("window_minutes", 60))) * 60
@@ -1471,13 +1482,15 @@ class AppManager:
         cfg = self._product_owner_cfg(rt)
         if cfg is None:
             return False
-        sched = self._today_scheduled_ts(cfg.get("at_utc", "10:00"), now)
+        sched = self._today_scheduled_ts(
+            cfg.get("at_local") or cfg.get("at_utc", "10:00"), now,
+        )
         if sched is None:
             return False
-        # day-of-week gate (-1 means daily)
+        # day-of-week gate (-1 means daily) — local-time semantics
         dow = int(cfg.get("day_of_week", 0))
         if dow >= 0:
-            if time.gmtime(now).tm_wday != dow:
+            if time.localtime(now).tm_wday != dow:
                 return False
         # 60-minute window from the scheduled time; longer than auto-update's
         # default because a product-owner run can legitimately take hours

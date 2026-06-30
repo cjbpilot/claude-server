@@ -49,6 +49,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -80,10 +81,13 @@ VALID_PRODUCT_OWNER_RESULTS = (
 
 def default_auto_update_config() -> dict:
     """Sensible defaults applied when an operator first turns auto-update on
-    without supplying every field."""
+    without supplying every field. `at_local` is HH:MM in the machine's
+    local timezone — `time.localtime()` / `time.mktime()` resolve it to
+    today's unix ts including DST, so "05:00" means 5am wall-clock both
+    in BST summer and GMT winter."""
     return {
         "enabled": False,
-        "at_utc": "05:00",
+        "at_local": "05:00",
         "window_minutes": 60,
         "skip_if_maintenance": True,
         "rollback_on_health_fail": True,
@@ -98,14 +102,15 @@ def default_auto_update_config() -> dict:
 
 def default_product_owner_config() -> dict:
     """Defaults for the product-owner review cadence. day_of_week is 0=Mon
-    through 6=Sun, matching Python's time.gmtime().tm_wday. -1 means daily.
+    through 6=Sun, matching Python's time.localtime().tm_wday. -1 means
+    daily. `at_local` is the machine's local-clock fire time (HH:MM).
     feedback_window_hours is how long the agent waits for Telegram replies
     after posting its 'anything you want added?' question; 0 skips Telegram
     entirely and goes straight to web+code synthesis."""
     return {
         "enabled": False,
         "day_of_week": 0,           # Monday
-        "at_utc": "10:00",          # 11:00 BST / 06:00 ET / 03:00 PT
+        "at_local": "10:00",        # machine-local wall clock
         "feedback_window_hours": 6,
         "max_specs": 3,
         "skip_if_maintenance": True,
@@ -116,6 +121,51 @@ def default_product_owner_config() -> dict:
         "last_branch": None,
         "last_spec_count": 0,
     }
+
+
+def _utc_clock_to_local_clock(at_utc_str: str) -> Optional[str]:
+    """Convert an 'HH:MM' UTC time-of-day to the equivalent 'HH:MM' in the
+    machine's CURRENT local timezone. Used by the one-shot migration from
+    the old `at_utc` field to the new `at_local` field so an operator who
+    set "04:00" UTC (= 05:00 BST) sees that intent preserved as
+    `at_local: "05:00"` — fire moment stays the same.
+
+    Returns None on bad input."""
+    try:
+        h_str, m_str = at_utc_str.split(":")
+        h = int(h_str)
+        m = int(m_str)
+        if not (0 <= h < 24 and 0 <= m < 60):
+            return None
+    except (ValueError, AttributeError):
+        return None
+    utc_dt = datetime.now(timezone.utc).replace(
+        hour=h, minute=m, second=0, microsecond=0,
+    )
+    local_dt = utc_dt.astimezone()
+    return f"{local_dt.hour:02d}:{local_dt.minute:02d}"
+
+
+def _migrate_schedule_field(sub: dict) -> dict:
+    """In-place migration: if a sub-document has `at_utc` but no
+    `at_local`, populate `at_local` with the wall-clock equivalent in the
+    machine's CURRENT local timezone. Idempotent — once `at_local` exists
+    we leave it alone. The vestigial `at_utc` key is dropped on the next
+    write through upsert/set, but kept here so the migration can run
+    again on an older copy if needed.
+
+    Called for both auto_update and product_owner sub-documents."""
+    if not isinstance(sub, dict):
+        return sub
+    if "at_local" in sub and sub["at_local"]:
+        return sub
+    legacy = sub.get("at_utc")
+    if not legacy:
+        return sub
+    converted = _utc_clock_to_local_clock(legacy)
+    if converted:
+        sub["at_local"] = converted
+    return sub
 
 
 @dataclass
@@ -190,6 +240,8 @@ def list_records() -> list[AppRecord]:
     obj = _load_raw()
     out = []
     for name, e in obj.get("apps", {}).items():
+        au = _migrate_schedule_field(dict(e.get("auto_update") or {}))
+        po = _migrate_schedule_field(dict(e.get("product_owner") or {}))
         out.append(AppRecord(
             name=name,
             repo_name=str(e.get("repo_name", "")),
@@ -199,8 +251,8 @@ def list_records() -> list[AppRecord]:
             registered_at=int(e.get("registered_at", 0)),
             updated_at=int(e.get("updated_at", 0)),
             last_known_sha=e.get("last_known_sha"),
-            auto_update=dict(e.get("auto_update") or {}),
-            product_owner=dict(e.get("product_owner") or {}),
+            auto_update=au,
+            product_owner=po,
         ))
     return out
 
@@ -276,7 +328,11 @@ def set_mode(name: str, mode: str) -> Optional[AppRecord]:
 
 
 _AUTO_UPDATE_ALLOWED_KEYS = {
-    "enabled", "at_utc", "window_minutes",
+    # `at_local` is the wall-clock fire time in the machine's local TZ.
+    # `at_utc` is accepted for backward-compat ONLY — anything written
+    # under that key is converted to its local-clock equivalent and
+    # stored as `at_local`; we never persist `at_utc` going forward.
+    "enabled", "at_local", "at_utc", "window_minutes",
     "skip_if_maintenance", "rollback_on_health_fail", "notify_telegram",
 }
 
@@ -286,23 +342,40 @@ def set_auto_update(name: str, partial: dict) -> Optional[AppRecord]:
 
     Only the operator-controlled fields can be set this way (last_run_at /
     last_result / last_*_sha are written by record_auto_update_run as the
-    supervisor runs cycles). Unknown keys are silently dropped. Returns the
-    updated record, or None if the app is unknown.
+    supervisor runs cycles). Unknown keys are silently dropped.
+
+    Backward-compat: if the caller still passes `at_utc`, we translate it
+    to `at_local` (preserving wall-clock fire moment) and store under the
+    new field name. The legacy `at_utc` key is dropped on the write.
     """
     obj = _load_raw()
     apps = obj.setdefault("apps", {})
     if name not in apps:
         return None
-    existing = dict(apps[name].get("auto_update") or {})
+    existing = _migrate_schedule_field(dict(apps[name].get("auto_update") or {}))
     if not existing:
         existing = default_auto_update_config()
+    time_changed = False
     for k, v in partial.items():
-        if k in _AUTO_UPDATE_ALLOWED_KEYS:
-            existing[k] = v
+        if k not in _AUTO_UPDATE_ALLOWED_KEYS:
+            continue
+        if k == "at_utc":
+            converted = _utc_clock_to_local_clock(v)
+            if converted:
+                existing["at_local"] = converted
+                time_changed = True
+            continue
+        if k == "at_local":
+            existing["at_local"] = v
+            time_changed = True
+            continue
+        existing[k] = v
+    # Drop the legacy field permanently on any write through this path.
+    existing.pop("at_utc", None)
     # If the operator changed the time, clear last_run_at so today's new slot
     # is eligible to fire (otherwise yesterday's run blocks a freshly-edited
     # earlier-in-the-day schedule).
-    if "at_utc" in partial:
+    if time_changed:
         existing["last_run_at"] = 0
     apps[name]["auto_update"] = existing
     apps[name]["updated_at"] = int(time.time())
@@ -346,25 +419,41 @@ def record_auto_update_run(
 
 
 _PRODUCT_OWNER_ALLOWED_KEYS = {
-    "enabled", "day_of_week", "at_utc", "feedback_window_hours",
+    # Same backward-compat shape as auto_update: `at_local` is the new
+    # canonical field, `at_utc` is accepted on writes for convenience and
+    # transparently translated.
+    "enabled", "day_of_week", "at_local", "at_utc", "feedback_window_hours",
     "max_specs", "skip_if_maintenance", "notify_telegram",
 }
 
 
 def set_product_owner(name: str, partial: dict) -> Optional[AppRecord]:
     """Merge operator-supplied product-owner config into the persisted
-    sub-document. Same shape as set_auto_update."""
+    sub-document. Same shape and migration semantics as set_auto_update."""
     obj = _load_raw()
     apps = obj.setdefault("apps", {})
     if name not in apps:
         return None
-    existing = dict(apps[name].get("product_owner") or {})
+    existing = _migrate_schedule_field(dict(apps[name].get("product_owner") or {}))
     if not existing:
         existing = default_product_owner_config()
+    time_changed = False
     for k, v in partial.items():
-        if k in _PRODUCT_OWNER_ALLOWED_KEYS:
-            existing[k] = v
-    if "at_utc" in partial or "day_of_week" in partial:
+        if k not in _PRODUCT_OWNER_ALLOWED_KEYS:
+            continue
+        if k == "at_utc":
+            converted = _utc_clock_to_local_clock(v)
+            if converted:
+                existing["at_local"] = converted
+                time_changed = True
+            continue
+        if k == "at_local":
+            existing["at_local"] = v
+            time_changed = True
+            continue
+        existing[k] = v
+    existing.pop("at_utc", None)
+    if time_changed or "day_of_week" in partial:
         # Reset last-run so the new slot is eligible the same day if it has
         # not already passed — same logic as auto-update.
         existing["last_run_at"] = 0

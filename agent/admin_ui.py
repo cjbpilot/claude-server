@@ -26,9 +26,9 @@ Endpoints:
   POST /api/host/restart?delay_s=30
   POST /api/host/cancel
   POST /api/self_update
-  POST /api/apps/<name>/auto_update         body: {enabled?, at_utc?, window_minutes?, ...}
+  POST /api/apps/<name>/auto_update         body: {enabled?, at_local?, window_minutes?, ...}
   POST /api/apps/<name>/auto_update_now     fire the auto-update path now
-  POST /api/apps/<name>/product_owner       body: {enabled?, at_utc?, day_of_week?, ...}
+  POST /api/apps/<name>/product_owner       body: {enabled?, at_local?, day_of_week?, ...}
   POST /api/apps/<name>/product_owner_now   fire a product-owner review now
 """
 
@@ -212,7 +212,7 @@ async function loadApps() {
       const resultKind = (au.last_result === 'ok' || au.last_result === 'no_change') ? 'ok'
                        : (au.last_result === 'skipped_maintenance') ? 'warn'
                        : (au.last_result == null) ? '' : 'bad';
-      auCell = pill(au.at_utc + ' UTC', 'ok');
+      auCell = pill((au.at_local || au.at_utc) + ' local', 'ok');
       if (au.last_result) {
         auCell += ' ' + pill(au.last_result, resultKind);
       }
@@ -232,7 +232,7 @@ async function loadApps() {
       const dowLabel = (po.day_of_week === undefined || po.day_of_week === null || po.day_of_week === -1)
                        ? 'daily'
                        : ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'][po.day_of_week] || '?';
-      poCell = pill(dowLabel + ' ' + po.at_utc + ' UTC', 'ok');
+      poCell = pill(dowLabel + ' ' + (po.at_local || po.at_utc) + ' local', 'ok');
       if (po.last_result) {
         poCell += ' ' + pill(po.last_result + (po.last_spec_count ? ' (' + po.last_spec_count + ')' : ''), poResultKind);
       }

@@ -205,6 +205,7 @@ async def set_app_mode(name: str, mode: str) -> str:
 async def set_auto_update(
     name: str,
     enabled: bool | None = None,
+    at_local: str | None = None,
     at_utc: str | None = None,
     window_minutes: int | None = None,
     skip_if_maintenance: bool | None = None,
@@ -212,14 +213,15 @@ async def set_auto_update(
     notify_telegram: bool | None = None,
 ) -> str:
     """Configure scheduled auto-update for a managed app. Each daily tick at
-    `at_utc` (UTC, HH:MM, 24-hour) pulls the app's repo and, if the SHA
-    advanced, rebuilds + relaunches. `window_minutes` caps how long after
-    the scheduled time the agent will still attempt the update — useful so
-    a host that boots at noon doesn't accidentally fire a 05:00 cycle.
+    `at_local` (HH:MM, 24-hour, **the managed host's local timezone** —
+    e.g. "05:00" means 5am wall clock both in BST summer and GMT winter)
+    pulls the app's repo and, if the SHA advanced, rebuilds + relaunches.
+    `window_minutes` caps how long after the scheduled time the agent
+    will still attempt the update — useful so a host that boots at noon
+    doesn't accidentally fire a 05:00 cycle.
 
-    Default UTC of 05:00 lands at 06:00 UK / 00:00 ET / 21:00 PT — quiet
-    across UK + US timezones. Pick a different `at_utc` for apps whose
-    audience lives elsewhere.
+    `at_utc` is accepted for backward compatibility and translated to the
+    equivalent `at_local` on write. New callers should use `at_local`.
 
     `rollback_on_health_fail` (default true): if the new build's /health
     doesn't return green within ~90s the supervisor restores the prev JAR,
@@ -234,6 +236,7 @@ async def set_auto_update(
     is preserved across re-registers."""
     args: dict = {"name": name}
     if enabled is not None: args["enabled"] = enabled
+    if at_local is not None: args["at_local"] = at_local
     if at_utc is not None: args["at_utc"] = at_utc
     if window_minutes is not None: args["window_minutes"] = window_minutes
     if skip_if_maintenance is not None:
@@ -259,6 +262,7 @@ async def set_product_owner(
     name: str,
     enabled: bool | None = None,
     day_of_week: int | None = None,
+    at_local: str | None = None,
     at_utc: str | None = None,
     feedback_window_hours: int | None = None,
     max_specs: int | None = None,
@@ -276,17 +280,21 @@ async def set_product_owner(
     `product-owner/<date>`, and pushed to origin so you can open a PR
     by hand. A summary is posted to Telegram on completion.
 
-    `day_of_week`: 0=Mon ... 6=Sun, or -1 for daily. `at_utc`: HH:MM UTC,
-    24-hour. `feedback_window_hours`: 0 to skip Telegram entirely and go
+    `day_of_week`: 0=Mon ... 6=Sun, or -1 for daily — evaluated in the
+    machine's local timezone. `at_local`: HH:MM 24-hour in the managed
+    host's local TZ. `at_utc` accepted for back-compat (translated on
+    write). `feedback_window_hours`: 0 to skip Telegram entirely and go
     straight to the LLM. `max_specs`: 1..10, default 3.
 
-    Defaults: weekly on Mondays at 10:00 UTC, 6h Telegram window, 3 specs.
+    Defaults: weekly on Mondays at 10:00 local, 6h Telegram window,
+    3 specs.
 
     Requires a valid Anthropic API key at
     C:\\ProgramData\\ClaudeAgent\\secrets\\anthropic.token (one line)."""
     args: dict = {"name": name}
     if enabled is not None: args["enabled"] = enabled
     if day_of_week is not None: args["day_of_week"] = day_of_week
+    if at_local is not None: args["at_local"] = at_local
     if at_utc is not None: args["at_utc"] = at_utc
     if feedback_window_hours is not None:
         args["feedback_window_hours"] = feedback_window_hours
