@@ -17,6 +17,7 @@ from agent import __version__, config
 from agent.handlers import REGISTRY, HandlerCtx
 from agent.handlers.self_update import UPDATE_REPORT_PATH
 from agent.handlers.status import _ollama_up
+from agent.log_redaction import RedactingFilter
 from shared import protocol, subjects
 
 log = logging.getLogger("agent.runner")
@@ -282,9 +283,13 @@ def _setup_logging() -> None:
     except Exception:
         handler = logging.StreamHandler(sys.stderr)
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s"))
+    handler.addFilter(RedactingFilter())
     root = logging.getLogger()
     root.setLevel(logging.INFO)
     root.addHandler(handler)
+    # httpx logs every request URL at INFO; for Telegram that includes the bot token.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
 def _prevent_sleep() -> None:
