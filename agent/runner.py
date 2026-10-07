@@ -139,9 +139,20 @@ class Runner:
         )
         await nc.subscribe(
             subjects.cmd_wildcard(self.cfg.host_id),
-            cb=self._handle_message,
+            cb=self._dispatch_message,
         )
         return nc
+
+    async def _dispatch_message(self, msg) -> None:
+        """Handle each command as its own task.
+
+        nats-py runs a subscription's callbacks one at a time, so awaiting
+        the handler here made every command wait for the one before it: a
+        60 s run_command or a git_pull build held up the watchdog's 10 s
+        ping, the watchdog judged the agent hung and killed it, and the
+        apps it supervises (jeeves) went down with it.
+        """
+        self.spawn(self._handle_message(msg))
 
     async def _nats_watchdog(self) -> None:
         """Periodically verify the NATS link is alive; rebuild it if not.
