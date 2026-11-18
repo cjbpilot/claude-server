@@ -99,6 +99,7 @@ BOT_COMMANDS: list[tuple[str, str]] = [
     ("app_start", "Start an app: /app_start <name>"),
     ("app_stop", "Stop an app: /app_stop <name>"),
     ("app_restart", "Restart an app: /app_restart <name>"),
+    ("update", "Re-run build+deploy for a managed app: /update <name>"),
     ("repos", "List registered repos"),
     ("pull", "git_pull a repo: /pull <repo>"),
     ("services", "List allowlisted Windows services"),
@@ -139,6 +140,8 @@ App control:
   /app_start <name>
   /app_stop <name>
   /app_restart <name>
+  /update <name>    re-run build+deploy (git_pull + rebuild + cycle;
+                    rolls back on health fail). Takes 2-5 min.
 
 Repo control:
   /pull <repo>    git_pull
@@ -275,6 +278,7 @@ class TelegramBot:
             ("app_start", self.cmd_app_start),
             ("app_stop", self.cmd_app_stop),
             ("app_restart", self.cmd_app_restart),
+            ("update", self.cmd_update),
             ("app_logs", self.cmd_app_logs),
             ("pull", self.cmd_pull),
             ("service_restart", self.cmd_service_restart),
@@ -483,7 +487,8 @@ class TelegramBot:
             payload = data[len("app_action:"):]
             action, _, name = payload.partition(":")
             tool_map = {"start": "start_app", "stop": "stop_app",
-                        "restart": "restart_app", "logs": "app_logs"}
+                        "restart": "restart_app", "logs": "app_logs",
+                        "update": "auto_update_now"}
             tool = tool_map.get(action)
             if not tool:
                 await self._send(update, f"unknown action: {action}")
@@ -491,6 +496,10 @@ class TelegramBot:
             args = {"name": name}
             if action == "logs":
                 args["lines"] = 50
+            if action == "update":
+                await self._send(update,
+                    f"⏳ auto_update_now {name} — pulling, rebuilding and cycling. "
+                    f"This blocks for 2-5 min; rollback on health fail.")
             result = await self._call(tool, args)
             await self._send(update, result)
             return
@@ -550,6 +559,9 @@ class TelegramBot:
                     InlineKeyboardButton(f"▶ start {name}", callback_data=f"app_action:start:{name}"),
                     InlineKeyboardButton(f"■ stop {name}", callback_data=f"app_action:stop:{name}"),
                     InlineKeyboardButton(f"↻ restart {name}", callback_data=f"app_action:restart:{name}"),
+                ])
+                rows.append([
+                    InlineKeyboardButton(f"🔄 update {name}", callback_data=f"app_action:update:{name}"),
                 ])
         rows.append([InlineKeyboardButton("📋 list_apps", callback_data="run:list_apps")])
         rows.append(_menu_back_row())
@@ -633,6 +645,20 @@ class TelegramBot:
     async def cmd_app_restart(self, u, c):      await self._with_arg(u, c, "restart_app", "name")
     async def cmd_pull(self, u, c):             await self._with_arg(u, c, "git_pull", "repo")
     async def cmd_service_restart(self, u, c):  await self._with_arg(u, c, "service_restart", "name")
+
+    async def cmd_update(self, u, c):
+        if not self._authorized(u):
+            await self._reject(u)
+            return
+        if not c.args:
+            await u.effective_message.reply_text("usage: /update <name>")
+            return
+        name = c.args[0]
+        await u.effective_message.reply_text(
+            f"⏳ auto_update_now {name} — pulling, rebuilding and cycling. "
+            f"This blocks for 2-5 min; rollback on health fail."
+        )
+        await self._send(u, await self._call("auto_update_now", {"name": name}, update=u))
 
     async def cmd_app_logs(self, u, c):
         if not self._authorized(u):
@@ -964,6 +990,20 @@ def _fmt_watchdog(d: dict) -> str:
     return "\n".join(L)
 
 
+def _fmt_auto_update_now(d: dict) -> str:
+    result = d.get("result") or "?"
+    msg = d.get("message") or ""
+    prev = (d.get("prev_sha") or "")[:7]
+    new = (d.get("new_sha") or "")[:7]
+    icon = {"ok": "✅", "noop": "ℹ️"}.get(result, "❌")
+    line = f"{icon} auto_update_now: {result}"
+    if msg:
+        line += f" — {msg}"
+    if prev or new:
+        line += f"\n  {prev or '?'} → {new or '?'}"
+    return line
+
+
 def _fmt_telegram_status(d: dict) -> str:
     running = d.get("running")
     allow = d.get("allowlist") or []
@@ -1016,6 +1056,7 @@ _FORMATTERS = {
     "git_pull": _fmt_simple_named,            # used only when no job_id
     "service_restart": _fmt_simple_named,     # ditto
     "self_update": _fmt_self_update,
+    "auto_update_now": _fmt_auto_update_now,
     "host_restart": _fmt_host_restart,
     "host_cancel_restart": _fmt_host_cancel,
     "telegram_status": _fmt_telegram_status,
